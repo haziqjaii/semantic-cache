@@ -1,0 +1,36 @@
+[project]
+name = "semcache"
+version = "0.1.0"
+description = "Semantic caching layer for LLM APIs — cache semantically similar requests to cut latency and costs."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "google-genai>=1.0",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "redis>=5.0",
+    "redisvl>=0.4",
+    "pydantic-settings>=2.0",
+    "httpx>=0.27",
+    "prometheus-fastapi-instrumentator>=7.0",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+local = [
+    "sentence-transformers>=3.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+semcache = "semcache.main:run"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
