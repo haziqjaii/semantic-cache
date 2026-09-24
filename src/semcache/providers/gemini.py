@@ -41,7 +41,7 @@ class GeminiProvider(LLMProvider):
                 # Gemini roles are "user" and "model"
                 gemini_role = "user" if msg.role == "user" else "model"
                 contents.append(
-                    types.Content(role=gemini_role, parts=[types.Part.from_text(msg.content)])
+                    types.Content(role=gemini_role, parts=[types.Part.from_text(text=msg.content)])
                 )
 
         # 2. Translate Config
