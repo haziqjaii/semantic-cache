@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from semcache.cache.engine import CacheEngine
-from semcache.cache.policy import CachePolicy
+from semcache.cache.policy import CachePolicy, TTLTier
 from semcache.cache.store.redis_store import RedisVectorStore
 from semcache.config import get_settings
 from semcache.embeddings.gemini import GeminiEmbedder
