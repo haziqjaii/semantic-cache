@@ -44,10 +44,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         dims=settings.embedding_dims,
     )
 
+    # Map the configured TTL seconds to the closest TTLTier
+    tier = next(
+        (t for t in TTLTier if t.value == settings.default_ttl_seconds), 
+        TTLTier.LONG
+    )
+    
     # 3. Build Engine with default policy from settings
     default_policy = CachePolicy(
         similarity_threshold=settings.default_similarity_threshold,
-        ttl_seconds=settings.default_ttl_seconds,
+        ttl_tier=tier,
     )
     
     _engine = CacheEngine(
