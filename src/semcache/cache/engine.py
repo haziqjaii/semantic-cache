@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from semcache.cache.keys import build_namespace
 from semcache.cache.policy import DEFAULT_POLICY, CachePolicy
@@ -217,7 +217,7 @@ class CacheEngine:
             response=response,
             model=model,
             namespace=lookup_result.namespace,
-            created_at=datetime.now(timezone.utc),
+            created_at=datetime.now(UTC),
             ttl_seconds=final_ttl,
             hit_count=0,
             response_metadata=response_metadata,

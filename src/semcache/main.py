@@ -1,35 +1,43 @@
 """
 FastAPI application entry point.
-
-This is a minimal placeholder for Phase 1. The full API routes
-(chat completions proxy, admin endpoints) come in Phase 2.
-
-For now, it just starts the server with a health check endpoint
-so we can verify the project structure works.
 """
 
-import uvicorn
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+
+from semcache.api import chat
+from semcache.api.dependencies import lifespan
 
 app = FastAPI(
     title="Semantic Cache",
     description="Semantic caching layer for LLM APIs",
     version="0.1.0",
+    lifespan=lifespan,
 )
+
+# Register the v1 router
+app.include_router(chat.router, prefix="/v1")
 
 
 @app.get("/health")
 async def health_check():
-    """Basic health check — confirms the server is running."""
-    return {"status": "ok", "version": "0.1.0"}
+    """Basic health check."""
+    return JSONResponse(content={"status": "ok", "version": "0.1.0"})
 
 
 def run() -> None:
     """Entry point for the `semcache` CLI command (see pyproject.toml)."""
+    import uvicorn
+
+    from semcache.config import get_settings
+
+    # Safe to call here since run() is explicit execution, not import-time
+    settings = get_settings()
+    
     uvicorn.run(
         "semcache.main:app",
-        host="0.0.0.0",
-        port=8000,
+        host=settings.host,
+        port=settings.port,
         reload=True,  # auto-restart on code changes during development
     )
 
