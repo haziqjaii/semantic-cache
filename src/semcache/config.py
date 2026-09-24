@@ -63,9 +63,3 @@ def get_settings() -> Settings:
     """
     return Settings()  # type: ignore[call-arg]
 
-
-# Convenience alias — import this directly in modules that need config.
-# Note: This evaluates at import time. If .env is missing GEMINI_API_KEY,
-# the app crashes immediately with a validation error. That's intentional.
-# Fail fast > fail mysteriously.
-settings = get_settings()

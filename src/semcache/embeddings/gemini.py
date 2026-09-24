@@ -18,12 +18,12 @@ HOW EMBEDDINGS WORK (conceptual):
     completely unrelated texts approach 0.0.
 
 WHY gemini-embedding-001?
-    - Free tier: 1,500 requests/day (more than enough for development)
     - 768 dimensions by default (good balance of quality vs. speed)
     - Configurable output_dimensionality (can shrink for faster lookups)
     - Same SDK (google-genai) we use for generation — one dependency
 """
 
+import numpy as np
 from google import genai
 from google.genai import types
 
@@ -47,49 +47,45 @@ class GeminiEmbedder(Embedder):
         model: str = "gemini-embedding-001",
         dims: int = 768,
     ) -> None:
-        # The genai Client handles auth, retries, and connection pooling.
-        # We create it once and reuse it for all embedding calls.
         self._client = genai.Client(api_key=api_key)
         self._model = model
         self._dims = dims
 
+    def _normalize(self, values: list[float]) -> list[float]:
+        """Normalize vector to unit length so cosine similarity works."""
+        vec = np.array(values, dtype=np.float32)
+        norm = np.linalg.norm(vec)
+        if norm > 0:
+            vec = vec / norm
+        return vec.tolist()
+
     async def embed(self, text: str) -> list[float]:
         """
-        Embed a single text string.
-
-        Note: The Gemini SDK's embed_content is synchronous under the hood.
-        We wrap it here to match our async interface. In Phase 2, when we're
-        inside FastAPI's async request handlers, this prevents blocking the
-        event loop (FastAPI runs sync functions in a thread pool automatically
-        when called from async routes via Depends()).
+        Embed a single text string using the async client.
         """
-        response = self._client.models.embed_content(
+        response = await self._client.aio.models.embed_content(
             model=self._model,
             contents=text,
             config=types.EmbedContentConfig(
                 output_dimensionality=self._dims,
+                task_type="SEMANTIC_SIMILARITY",
             ),
         )
-        # response.embeddings is a list (one per input content).
-        # We sent one text, so we get one embedding back.
-        return response.embeddings[0].values
+        return self._normalize(response.embeddings[0].values)
 
     async def embed_batch(self, texts: list[str]) -> list[list[float]]:
         """
-        Embed multiple texts in a single API call.
-
-        The Gemini API accepts a list of contents and returns embeddings
-        for all of them in one round-trip. This is 5-10x faster than
-        calling embed() in a loop for bulk operations.
+        Embed multiple texts in a single API call using the async client.
         """
         if not texts:
             return []
 
-        response = self._client.models.embed_content(
+        response = await self._client.aio.models.embed_content(
             model=self._model,
             contents=texts,
             config=types.EmbedContentConfig(
                 output_dimensionality=self._dims,
+                task_type="SEMANTIC_SIMILARITY",
             ),
         )
-        return [emb.values for emb in response.embeddings]
+        return [self._normalize(emb.values) for emb in response.embeddings]

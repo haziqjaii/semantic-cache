@@ -56,12 +56,11 @@ class TestCacheEngine:
         )
 
         # Step 3: Lookup again (hit).
-        # With threshold=0.0 to guarantee a hit with our mock embedder
-        # (same text → same vector → similarity=1.0).
+        # With identical text, our mock embedder gives similarity=1.0,
+        # so it easily clears the default 0.95 threshold.
         hit_result = await engine.lookup(
             prompt="What is Python?",
             model="gemini-3.5-flash",
-            policy=CachePolicy(ttl_tier=TTLTier.LONG, similarity_threshold=0.0),
         )
         assert hit_result.hit is True
         assert hit_result.entry is not None

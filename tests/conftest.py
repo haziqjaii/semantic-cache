@@ -51,7 +51,8 @@ class MockEmbedder(Embedder):
         # Expand the hash to fill our vector dimensions.
         # We cycle through the hash bytes to fill the vector.
         expanded = (hash_bytes * (self._dims // len(hash_bytes) + 1))[:self._dims]
-        vec = np.frombuffer(bytearray(expanded), dtype=np.uint8).astype(np.float32)
+        # Center around 0 by subtracting 127.5 so unrelated texts can have negative/low cosine
+        vec = np.frombuffer(bytearray(expanded), dtype=np.uint8).astype(np.float32) - 127.5
         # Normalize to unit length (required for meaningful cosine similarity).
         norm = np.linalg.norm(vec)
         if norm > 0:

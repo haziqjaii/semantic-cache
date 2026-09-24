@@ -80,10 +80,6 @@ def _build_schema(dims: int) -> dict:
             # BEFORE doing vector search, so Redis only compares vectors
             # within the same namespace. This is crucial for isolation.
             {"name": "namespace", "type": "tag"},
-            # TEXT fields — stored but not used for vector search.
-            # TEXT type allows full-text search if we ever need it.
-            {"name": "prompt", "type": "text"},
-            {"name": "response", "type": "text"},
             {"name": "model", "type": "tag"},
             {"name": "created_at", "type": "text"},
             {"name": "ttl_seconds", "type": "numeric"},
@@ -274,23 +270,29 @@ class RedisVectorStore(VectorStore):
     async def delete_by_namespace(self, namespace: str) -> int:
         """
         Delete all entries in a namespace.
-
-        Uses SCAN to find matching keys (never KEYS * — that blocks Redis
-        on large datasets). Then deletes them in batches.
         """
         if self._redis is None:
             raise RuntimeError("Store not initialized. Call initialize() first.")
 
-        deleted = 0
-        # SCAN iterates over keys without blocking Redis.
-        # MATCH filters by our key prefix. We then check namespace.
-        async for key in self._redis.scan_iter(match=f"{KEY_PREFIX}*"):
-            ns = await self._redis.hget(key, "namespace")
-            if ns and ns.decode("utf-8") == namespace:
-                await self._redis.delete(key)
-                deleted += 1
-
-        return deleted
+        # RedisVL provides a clean way to fetch keys matching a filter
+        from redisvl.query import FilterQuery
+        
+        # We can just fetch the ids
+        query = FilterQuery(
+            filter_expression=f"@namespace:{{{namespace}}}",
+            return_fields=["id"],
+            num_results=10000,
+        )
+        
+        results = await self._index.query(query)
+        if not results:
+            return 0
+            
+        keys_to_delete = [res["id"] for res in results if "id" in res]
+        if keys_to_delete:
+            await self._redis.delete(*keys_to_delete)
+            return len(keys_to_delete)
+        return 0
 
     async def count(self, namespace: str | None = None) -> int:
         """Count entries, optionally filtered by namespace."""
@@ -302,18 +304,13 @@ class RedisVectorStore(VectorStore):
             info = await self._index.info()
             return int(info.get("num_docs", 0))
 
-        # Count within a specific namespace using a filter query.
-        # We use a vector query with a dummy vector just to count.
-        dummy = np.zeros(self._dims, dtype=np.float32).tobytes()
-        query = VectorQuery(
-            vector=dummy,
-            vector_field_name="embedding",
-            return_fields=[],
-            filter_expression=f"@namespace:{{{namespace}}}",
-            num_results=10000,  # upper bound
-        )
-        results = await self._index.query(query)
-        return len(results)
+        # We use a direct FT.SEARCH with LIMIT 0 0 to get the count
+        # without fetching any documents.
+        from redis.commands.search.query import Query
+        
+        q = Query(f"@namespace:{{{namespace}}}").paging(0, 0)
+        res = await self._redis.ft(INDEX_NAME).search(q)
+        return res.total
 
     async def close(self) -> None:
         """Close the Redis connection."""

@@ -31,6 +31,11 @@ dev = [
 [project.scripts]
 semcache = "semcache.main:run"
 
+[tool.pytest.ini_options]
+markers = [
+    "integration: marks tests as requiring external services (e.g. Redis)",
+]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

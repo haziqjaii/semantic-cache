@@ -62,6 +62,7 @@ class LookupResult:
     similarity: float = 0.0
     namespace: str = ""
     embedding: list[float] | None = None  # cached for later store() call
+    policy: CachePolicy | None = None
 
 
 class CacheEngine:
@@ -76,9 +77,11 @@ class CacheEngine:
         self,
         embedder: Embedder,
         store: VectorStore,
+        default_policy: CachePolicy | None = None,
     ) -> None:
         self._embedder = embedder
         self._store = store
+        self._default_policy = default_policy or DEFAULT_POLICY
 
     async def lookup(
         self,
@@ -115,12 +118,12 @@ class CacheEngine:
             LookupResult with hit=True and the cached entry,
             or hit=False and the embedding (saved for the store() call).
         """
-        policy = policy or DEFAULT_POLICY
+        policy = policy or self._default_policy
 
         # Skip cache entirely for NO_CACHE policies.
         if policy.ttl_seconds == 0:
             logger.debug("Cache skip: NO_CACHE policy for prompt: %s", prompt[:50])
-            return LookupResult(hit=False, namespace="", embedding=None)
+            return LookupResult(hit=False, namespace="", embedding=None, policy=policy)
 
         # Step 1: Build the namespace hash.
         namespace = build_namespace(
@@ -153,6 +156,7 @@ class CacheEngine:
                 similarity=similarity,
                 namespace=namespace,
                 embedding=embedding,
+                policy=policy,
             )
 
         logger.info("Cache MISS for prompt: %s", prompt[:50])
@@ -160,6 +164,7 @@ class CacheEngine:
             hit=False,
             namespace=namespace,
             embedding=embedding,
+            policy=policy,
         )
 
     async def store(
@@ -181,6 +186,7 @@ class CacheEngine:
 
         Args:
             lookup_result: The LookupResult from the lookup() call.
+            prompt: The original user prompt.
             response: The full LLM response text.
             model: The model that generated the response.
             response_metadata: Optional metadata (token counts, etc.).
@@ -198,13 +204,21 @@ class CacheEngine:
                 "This happens when the policy was NO_CACHE."
             )
 
+        # Determine TTL: explicitly provided > policy attached to lookup > engine default
+        if ttl_seconds is not None:
+            final_ttl = ttl_seconds
+        elif lookup_result.policy is not None:
+            final_ttl = lookup_result.policy.ttl_seconds
+        else:
+            final_ttl = self._default_policy.ttl_seconds
+
         entry = CacheEntry(
             prompt=prompt,
             response=response,
             model=model,
             namespace=lookup_result.namespace,
             created_at=datetime.now(timezone.utc),
-            ttl_seconds=ttl_seconds or DEFAULT_POLICY.ttl_seconds,
+            ttl_seconds=final_ttl,
             hit_count=0,
             response_metadata=response_metadata,
         )
