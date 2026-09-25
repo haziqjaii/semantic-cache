@@ -134,9 +134,10 @@ async def chat_completions(
         logger.warning("Classifier raised in gather: %s", classify_result)
         resolved_policy: CachePolicy = DEFAULT_POLICY
         metrics.classifier_calls_fallback += 1
-    elif isinstance(classify_result, CachePolicy):
-        resolved_policy = classify_result
+    elif isinstance(classify_result, tuple) and len(classify_result) == 2 and isinstance(classify_result[0], CachePolicy):
+        resolved_policy, classifier_tokens = classify_result
         metrics.classifier_calls_success += 1
+        metrics.classifier_tokens_total += classifier_tokens
     else:
         logger.warning("Classifier returned unexpected type: %s", type(classify_result))
         resolved_policy = DEFAULT_POLICY

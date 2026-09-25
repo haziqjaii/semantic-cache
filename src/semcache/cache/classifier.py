@@ -96,7 +96,7 @@ class IntentClassifier:
         self._model = model
         self._timeout = timeout_seconds
 
-    async def classify(self, prompt: str) -> CachePolicy:
+    async def classify(self, prompt: str) -> tuple[CachePolicy, int]:
         """
         Classify a prompt and return the corresponding CachePolicy.
 
@@ -107,7 +107,7 @@ class IntentClassifier:
             prompt: The user's message text.
 
         Returns:
-            The CachePolicy for this prompt's intent category.
+            A tuple of (CachePolicy, total_tokens_used).
 
         Raises:
             Any exception from the Gemini SDK, asyncio timeout, etc.
@@ -136,6 +136,11 @@ class IntentClassifier:
             timeout=self._timeout,
         )
 
+        # Extract tokens used
+        tokens = 0
+        if response.usage_metadata:
+            tokens = response.usage_metadata.total_token_count
+
         # Parse the structured output.
         import json
 
@@ -145,18 +150,18 @@ class IntentClassifier:
         # Map to our predefined policies.
         policy = TASK_POLICIES.get(category_str, DEFAULT_POLICY)
 
-        logger.info("Classified prompt as '%s' → TTL=%ds, threshold=%.2f",
-                     category_str, policy.ttl_seconds, policy.similarity_threshold)
+        logger.info("Classified prompt as '%s' → TTL=%ds, threshold=%.2f (tokens: %d)",
+                     category_str, policy.ttl_seconds, policy.similarity_threshold, tokens)
 
-        return policy
+        return policy, tokens
 
-    async def classify_safe(self, prompt: str) -> CachePolicy:
+    async def classify_safe(self, prompt: str) -> tuple[CachePolicy, int]:
         """
         Safe wrapper around classify() that NEVER raises.
 
         If anything goes wrong (timeout, rate limit, malformed output,
-        network error), we log it and return DEFAULT_POLICY. The user's
-        request is never affected.
+        network error), we log it and return DEFAULT_POLICY and 0 tokens.
+        The user's request is never affected.
 
         This is what chat.py should always call.
         """
@@ -164,4 +169,4 @@ class IntentClassifier:
             return await self.classify(prompt)
         except Exception:
             logger.exception("Classifier failed, falling back to DEFAULT_POLICY")
-            return DEFAULT_POLICY
+            return DEFAULT_POLICY, 0

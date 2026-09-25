@@ -141,16 +141,16 @@ class CacheEngine:
 
         # Step 3: Search the vector store at the FLOOR threshold.
         # We use the most permissive threshold so we never miss a candidate
-        # that some intent category would have accepted.
-        result = await self._store.search(
+        # that some intent category would have accepted. We request top_k
+        # to ensure a strict-policy near-miss doesn't shadow a loose-policy hit.
+        candidates = await self._store.search(
             embedding=embedding,
             namespace=namespace,
             threshold=FLOOR_THRESHOLD,
+            top_k=5,
         )
 
-        if result is not None:
-            entry, similarity = result
-
+        for entry, similarity in candidates:
             # Step 4: Per-entry adaptive threshold check.
             # The entry knows its own required similarity (set by the
             # classifier when it was stored). We check it HERE, in Python,
@@ -162,6 +162,10 @@ class CacheEngine:
                     entry.required_similarity,
                     prompt[:50],
                 )
+                
+                # Record the hit in the store
+                await self._store.record_hit(entry.id)
+                
                 return LookupResult(
                     hit=True,
                     entry=entry,
@@ -178,6 +182,10 @@ class CacheEngine:
                 entry.required_similarity,
                 prompt[:50],
             )
+            # We import metrics here locally to avoid circular imports, or
+            # better yet, we just increment it.
+            from semcache.metrics import metrics
+            metrics.cache_near_misses += 1
 
         logger.info("Cache MISS for prompt: %s", prompt[:50])
         return LookupResult(

@@ -147,16 +147,10 @@ class RedisVectorStore(VectorStore):
         embedding: list[float],
         namespace: str,
         threshold: float = 0.95,
-    ) -> tuple[CacheEntry, float] | None:
+        top_k: int = 5,
+    ) -> list[tuple[CacheEntry, float]]:
         """
-        Find the nearest cached entry in the given namespace.
-
-        How RedisVL vector search works:
-          1. Convert our embedding to a binary blob (float32 bytes)
-          2. Build a VectorQuery with a namespace filter
-          3. Redis HNSW finds the K nearest neighbors
-          4. We check if the best match exceeds our similarity threshold
-          5. Cosine distance → similarity: similarity = 1 - distance
+        Find the most similar cached entries in the given namespace.
         """
         if self._index is None:
             raise RuntimeError("Store not initialized. Call initialize() first.")
@@ -164,9 +158,6 @@ class RedisVectorStore(VectorStore):
         # Convert to numpy float32 bytes — the format Redis expects.
         query_bytes = np.array(embedding, dtype=np.float32).tobytes()
 
-        # Build the vector query.
-        # num_results=1 because we only care about the BEST match.
-        # filter expression ensures we only search within our namespace.
         query = VectorQuery(
             vector=query_bytes,
             vector_field_name="embedding",
@@ -176,48 +167,42 @@ class RedisVectorStore(VectorStore):
                 "required_similarity", "response_metadata",
             ],
             filter_expression=f"@namespace:{{{namespace}}}",
-            num_results=1,
+            num_results=top_k,
         )
 
         results = await self._index.query(query)
 
-        if not results:
-            return None
+        candidates = []
+        for result in results:
+            distance = float(result.get("vector_distance", 1.0))
+            similarity = 1.0 - distance
 
-        # RedisVL returns results as dicts.
-        best = results[0]
+            if similarity < threshold:
+                continue
 
-        # Cosine DISTANCE is returned, not similarity.
-        # distance = 1 - similarity, so similarity = 1 - distance.
-        distance = float(best.get("vector_distance", 1.0))
-        similarity = 1.0 - distance
+            entry = CacheEntry(
+                prompt=result["prompt"],
+                response=result["response"],
+                model=result["model"],
+                namespace=result["namespace"],
+                created_at=datetime.fromisoformat(result["created_at"]),
+                ttl_seconds=int(result["ttl_seconds"]),
+                hit_count=int(result["hit_count"]),
+                required_similarity=float(result.get("required_similarity", 0.95)),
+                response_metadata=(
+                    json.loads(result["response_metadata"])
+                    if result.get("response_metadata")
+                    else None
+                ),
+                id=result.get("id", ""),
+            )
+            candidates.append((entry, similarity))
 
-        if similarity < threshold:
-            return None
+        return candidates
 
-        # Reconstruct the CacheEntry from Redis fields.
-        entry = CacheEntry(
-            prompt=best["prompt"],
-            response=best["response"],
-            model=best["model"],
-            namespace=best["namespace"],
-            created_at=datetime.fromisoformat(best["created_at"]),
-            ttl_seconds=int(best["ttl_seconds"]),
-            hit_count=int(best["hit_count"]),
-            required_similarity=float(best.get("required_similarity", 0.95)),
-            response_metadata=(
-                json.loads(best["response_metadata"])
-                if best.get("response_metadata")
-                else None
-            ),
-        )
-
-        # Increment hit count in Redis (fire-and-forget).
-        entry_key = best.get("id", "")
-        if entry_key:
-            await self._redis.hincrby(entry_key, "hit_count", 1)
-
-        return entry, similarity
+    async def record_hit(self, entry_id: str) -> None:
+        if self._redis and entry_id:
+            await self._redis.hincrby(entry_id, "hit_count", 1)
 
     async def store(
         self,

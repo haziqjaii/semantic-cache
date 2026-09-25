@@ -42,14 +42,15 @@ class TestClassifierSafe:
     async def test_timeout_falls_back_to_default(self, classifier: IntentClassifier):
         """
         If the classifier times out, classify_safe() should return
-        DEFAULT_POLICY, not raise.
+        (DEFAULT_POLICY, 0), not raise.
         """
         with patch.object(
             classifier, "classify", side_effect=TimeoutError("API timeout")
         ):
-            policy = await classifier.classify_safe("What is Python?")
+            policy, tokens = await classifier.classify_safe("What is Python?")
 
         assert policy == DEFAULT_POLICY
+        assert tokens == 0
 
     @pytest.mark.asyncio
     async def test_generic_exception_falls_back_to_default(
@@ -62,9 +63,10 @@ class TestClassifierSafe:
         with patch.object(
             classifier, "classify", side_effect=RuntimeError("API error")
         ):
-            policy = await classifier.classify_safe("How do I sort a list?")
+            policy, tokens = await classifier.classify_safe("How do I sort a list?")
 
         assert policy == DEFAULT_POLICY
+        assert tokens == 0
 
     @pytest.mark.asyncio
     async def test_successful_classification(self, classifier: IntentClassifier):
@@ -74,17 +76,17 @@ class TestClassifierSafe:
         """
         creative_policy = TASK_POLICIES["creative"]
         with patch.object(
-            classifier, "classify", return_value=creative_policy
+            classifier, "classify", return_value=(creative_policy, 15)
         ):
-            policy = await classifier.classify_safe("Write a poem about rain")
+            policy, tokens = await classifier.classify_safe("Write a poem about rain")
 
         assert policy == creative_policy
         assert policy.ttl_seconds == 0  # NO_CACHE
         assert policy.similarity_threshold == 0.99
+        assert tokens == 15
 
 
 # ── Adaptive Threshold Tests ─────────────────────────────────
-
 
 class TestAdaptiveThresholds:
     """
@@ -93,6 +95,68 @@ class TestAdaptiveThresholds:
     The key insight: "the threshold is a property of the cached entry,
     not a property of the request."
     """
+
+    @pytest.mark.asyncio
+    async def test_two_entries_top_k_shadowing(self):
+        """
+        A strict entry (required=0.95) might be the nearest neighbor (similarity=0.93)
+        but fail its own threshold. A loose entry (required=0.90) might be the 
+        second nearest neighbor (similarity=0.91). 
+        
+        If we only check top-1, we miss the loose entry.
+        If we check top-k, we correctly hit the loose entry.
+        """
+        from semcache.cache.store.base import CacheEntry
+        from semcache.cache.policy import TASK_POLICIES
+        from tests.conftest import InMemoryVectorStore, MockEmbedder
+        from semcache.cache.engine import CacheEngine
+        import numpy as np
+
+        store = InMemoryVectorStore()
+        embedder = MockEmbedder(dims=2)  # 2D for simple math
+        engine = CacheEngine(embedder=embedder, store=store)
+
+        # Get the namespace engine will actually use
+        lookup_res = await engine.lookup(prompt="Query", model="test-model")
+        namespace = lookup_res.namespace
+        
+        strict_entry = CacheEntry(
+            prompt="Factual prompt",
+            response="Factual answer",
+            model="test-model",
+            namespace=namespace,
+            created_at=None,
+            ttl_seconds=3600,
+            hit_count=0,
+            required_similarity=0.95
+        )
+        
+        loose_entry = CacheEntry(
+            prompt="Classification prompt",
+            response="Classification answer",
+            model="test-model",
+            namespace=namespace,
+            created_at=None,
+            ttl_seconds=3600,
+            hit_count=0,
+            required_similarity=0.90
+        )
+        
+        # We need normalized vectors for dot product to work correctly in InMemoryVectorStore
+        # Query: [1.0, 0.0]
+        # Vec 1 (sim 0.93): [0.93, sqrt(1 - 0.93^2)] -> [0.93, 0.367695]
+        # Vec 2 (sim 0.91): [0.91, sqrt(1 - 0.91^2)] -> [0.91, 0.414608]
+        await store.store([0.93, 0.367695], strict_entry)
+        await store.store([0.91, 0.414608], loose_entry)
+
+        # Mock the embedder to return our query vector
+        with patch.object(embedder, "embed", return_value=[1.0, 0.0]):
+            result = await engine.lookup(prompt="Query", model="test-model")
+            
+        assert result.hit is True
+        assert result.entry is not None
+        assert result.entry.prompt == "Classification prompt"
+        assert result.similarity == pytest.approx(0.91)
 
     @pytest_asyncio.fixture
     async def engine(self) -> CacheEngine:

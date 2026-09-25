@@ -68,6 +68,9 @@ class CacheEntry:
     # Stored as a JSON-serializable dict so we can return it to the client.
     response_metadata: dict | None = None
 
+    # The unique ID of this entry in the store (e.g., Redis key)
+    id: str = ""
+
 
 class VectorStore(ABC):
     """Interface for vector similarity search backends."""
@@ -78,22 +81,26 @@ class VectorStore(ABC):
         embedding: list[float],
         namespace: str,
         threshold: float = 0.95,
-    ) -> tuple[CacheEntry, float] | None:
+        top_k: int = 5,
+    ) -> list[tuple[CacheEntry, float]]:
         """
-        Find the most similar cached entry in the given namespace.
+        Find the most similar cached entries in the given namespace.
 
         Args:
             embedding: The query vector (from the user's prompt).
             namespace: Only search within this namespace (from keys.py).
-            threshold: Minimum cosine similarity to consider a "hit".
+            threshold: Minimum cosine similarity to return.
+            top_k: Max number of candidates to return.
 
         Returns:
-            A tuple of (CacheEntry, similarity_score) if a hit is found,
-            or None if no entry exceeds the threshold.
+            A list of tuples (CacheEntry, similarity_score) sorted by
+            similarity descending.
+        """
 
-        Why return the score too?
-            For monitoring and threshold tuning. We want to track the
-            distribution of similarity scores to find the optimal threshold.
+    @abstractmethod
+    async def record_hit(self, entry_id: str) -> None:
+        """
+        Increment the hit count for a specific entry.
         """
 
     @abstractmethod

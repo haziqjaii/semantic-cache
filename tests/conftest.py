@@ -84,9 +84,9 @@ class InMemoryVectorStore(VectorStore):
         embedding: list[float],
         namespace: str,
         threshold: float = 0.95,
-    ) -> tuple[CacheEntry, float] | None:
-        best_entry = None
-        best_score = -1.0
+        top_k: int = 5,
+    ) -> list[tuple[CacheEntry, float]]:
+        candidates = []
 
         query_vec = np.array(embedding, dtype=np.float32)
 
@@ -102,18 +102,24 @@ class InMemoryVectorStore(VectorStore):
                 continue
             similarity = dot / (norm_q * norm_s)
 
-            if similarity > best_score:
-                best_score = similarity
-                best_entry = entry
+            if similarity >= threshold:
+                candidates.append((entry, float(similarity)))
 
-        if best_entry is not None and best_score >= threshold:
-            return best_entry, float(best_score)
-        return None
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        return candidates[:top_k]
+
+    async def record_hit(self, entry_id: str) -> None:
+        for _, entry in self._entries:
+            if entry.id == entry_id:
+                entry.hit_count += 1
+                break
 
     async def store(self, embedding: list[float], entry: CacheEntry) -> str:
         import uuid
+        entry_id = str(uuid.uuid4())
+        entry.id = entry_id
         self._entries.append((embedding, entry))
-        return str(uuid.uuid4())
+        return entry_id
 
     async def delete_by_namespace(self, namespace: str) -> int:
         before = len(self._entries)
