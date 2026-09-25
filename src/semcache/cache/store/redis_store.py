@@ -202,7 +202,8 @@ class RedisVectorStore(VectorStore):
 
     async def record_hit(self, entry_id: str) -> None:
         if self._redis and entry_id:
-            await self._redis.hincrby(entry_id, "hit_count", 1)
+            key = entry_id if entry_id.startswith(KEY_PREFIX) else f"{KEY_PREFIX}{entry_id}"
+            await self._redis.hincrby(key, "hit_count", 1)
 
     async def store(
         self,

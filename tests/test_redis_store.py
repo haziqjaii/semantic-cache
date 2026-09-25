@@ -62,9 +62,9 @@ async def test_store_and_search(store: RedisVectorStore):
     assert entry_id is not None
 
     # Search with exact same vector
-    result = await store.search(emb, namespace, threshold=0.99)
-    assert result is not None
-    hit_entry, similarity = result
+    results = await store.search(emb, namespace, threshold=0.99)
+    assert results
+    hit_entry, similarity = results[0]
     
     assert similarity >= 0.99
     assert hit_entry.prompt == "hello"
@@ -84,11 +84,11 @@ async def test_namespace_filtering(store: RedisVectorStore):
     
     # Search in ns1 -> hit
     res_ns1 = await store.search(emb, "ns1", threshold=0.9)
-    assert res_ns1 is not None
+    assert len(res_ns1) > 0
     
     # Search in ns2 -> miss
     res_ns2 = await store.search(emb, "ns2", threshold=0.9)
-    assert res_ns2 is None
+    assert len(res_ns2) == 0
 
 
 @pytest.mark.asyncio
@@ -138,21 +138,18 @@ async def test_ttl_expiry(store: RedisVectorStore):
 @pytest.mark.asyncio
 @pytest.mark.integration
 async def test_hit_counts(store: RedisVectorStore):
-    """Test that searching increments the hit count."""
+    """Test that recording a hit increments the hit count."""
     emb = [1.0, 0.0, 0.0, 0.0]
     entry = CacheEntry(prompt="A", response="A", model="m", namespace="hit_ns")
     
     entry_id = await store.store(emb, entry)
     
-    # Search twice
-    await store.search(emb, "hit_ns", threshold=0.9)
-    await store.search(emb, "hit_ns", threshold=0.9)
+    # We now explicitly record hits
+    await store.record_hit(entry_id)
+    await store.record_hit(entry_id)
     
-    # Search one more time to inspect the returned entry's hit count.
-    # Note: the returned hit_count is the state BEFORE the increment
-    # because our search method retrieves the document and THEN increments.
-    # So on the 3rd search, we should see hit_count == 2.
+    # Search to inspect the returned entry's hit count.
     result = await store.search(emb, "hit_ns", threshold=0.9)
-    assert result is not None
-    hit_entry, _ = result
+    assert result
+    hit_entry, _ = result[0]
     assert hit_entry.hit_count == 2
