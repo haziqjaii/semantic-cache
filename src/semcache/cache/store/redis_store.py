@@ -83,6 +83,7 @@ def _build_schema(dims: int) -> dict:
             {"name": "model", "type": "tag"},
             {"name": "ttl_seconds", "type": "numeric"},
             {"name": "hit_count", "type": "numeric"},
+            {"name": "required_similarity", "type": "numeric"},
             # The embedding vector — this is what we search against.
             # HNSW = the index algorithm. COSINE = the distance metric.
             {
@@ -172,7 +173,7 @@ class RedisVectorStore(VectorStore):
             return_fields=[
                 "prompt", "response", "model", "namespace",
                 "created_at", "ttl_seconds", "hit_count",
-                "response_metadata",
+                "required_similarity", "response_metadata",
             ],
             filter_expression=f"@namespace:{{{namespace}}}",
             num_results=1,
@@ -203,6 +204,7 @@ class RedisVectorStore(VectorStore):
             created_at=datetime.fromisoformat(best["created_at"]),
             ttl_seconds=int(best["ttl_seconds"]),
             hit_count=int(best["hit_count"]),
+            required_similarity=float(best.get("required_similarity", 0.95)),
             response_metadata=(
                 json.loads(best["response_metadata"])
                 if best.get("response_metadata")
@@ -248,6 +250,7 @@ class RedisVectorStore(VectorStore):
             "created_at": entry.created_at.isoformat(),
             "ttl_seconds": entry.ttl_seconds,
             "hit_count": entry.hit_count,
+            "required_similarity": entry.required_similarity,
             "response_metadata": (
                 json.dumps(entry.response_metadata)
                 if entry.response_metadata

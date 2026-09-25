@@ -1,5 +1,5 @@
 """
-FastAPI dependencies for injecting singletons (Engine, Provider, Config).
+FastAPI dependencies for injecting singletons (Engine, Provider, Classifier).
 """
 
 from collections.abc import AsyncGenerator
@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from semcache.cache.classifier import IntentClassifier
 from semcache.cache.engine import CacheEngine
 from semcache.cache.policy import CachePolicy, TTLTier
 from semcache.cache.store.redis_store import RedisVectorStore
@@ -18,6 +19,7 @@ from semcache.providers.gemini import GeminiProvider
 # Global references for our singletons
 _engine: CacheEngine | None = None
 _provider: LLMProvider | None = None
+_classifier: IntentClassifier | None = None
 
 
 @asynccontextmanager
@@ -26,7 +28,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     FastAPI lifespan context manager.
     Runs on startup, yields control to the app, then runs cleanup on shutdown.
     """
-    global _engine, _provider
+    global _engine, _provider, _classifier
 
     settings = get_settings()
 
@@ -46,16 +48,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     # Map the configured TTL seconds to the closest TTLTier
     tier = next(
-        (t for t in TTLTier if t.value == settings.default_ttl_seconds), 
-        TTLTier.LONG
+        (t for t in TTLTier if t.value == settings.default_ttl_seconds),
+        TTLTier.LONG,
     )
-    
+
     # 3. Build Engine with default policy from settings
     default_policy = CachePolicy(
         similarity_threshold=settings.default_similarity_threshold,
         ttl_tier=tier,
     )
-    
+
     _engine = CacheEngine(
         embedder=embedder,
         store=store,
@@ -64,6 +66,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     # 4. Initialize LLM Provider
     _provider = GeminiProvider(api_key=settings.gemini_api_key)
+
+    # 5. Initialize Intent Classifier
+    _classifier = IntentClassifier(
+        api_key=settings.gemini_api_key,
+        model=settings.classifier_model,
+        timeout_seconds=settings.classifier_timeout_seconds,
+    )
 
     yield  # App runs here
 
@@ -81,3 +90,9 @@ def get_provider() -> LLMProvider:
     if _provider is None:
         raise RuntimeError("LLMProvider not initialized")
     return _provider
+
+
+def get_classifier() -> IntentClassifier:
+    if _classifier is None:
+        raise RuntimeError("IntentClassifier not initialized")
+    return _classifier

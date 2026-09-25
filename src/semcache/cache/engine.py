@@ -36,7 +36,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from semcache.cache.keys import build_namespace
-from semcache.cache.policy import DEFAULT_POLICY, CachePolicy
+from semcache.cache.policy import DEFAULT_POLICY, FLOOR_THRESHOLD, CachePolicy
 from semcache.cache.store.base import CacheEntry, VectorStore
 from semcache.embeddings.base import Embedder
 
@@ -99,12 +99,15 @@ class CacheEngine:
         Performance matters. The steps are:
           1. Build namespace (microseconds — just hashing)
           2. Embed the prompt (5-50ms — API call to Gemini)
-          3. Search Redis (0.1-1ms — sub-millisecond with HNSW)
+          3. Search Redis at FLOOR_THRESHOLD (0.1-1ms — sub-millisecond with HNSW)
+          4. Check similarity >= entry.required_similarity (microseconds — Python)
 
-        The embedding step dominates latency. On a cache miss, we've
-        "wasted" that embedding call. But on a hit, we save the full
-        LLM generation call (500-5000ms). The math works out as long
-        as hit rate > ~5%.
+        Why search at FLOOR_THRESHOLD instead of policy.similarity_threshold?
+            Because the threshold is a property of the CACHED ENTRY, not the
+            incoming request. A classification-intent entry stored at 0.90
+            should still be findable, even though the default is 0.95. We
+            query Redis at the most permissive threshold (0.90), then compare
+            in Python against the entry's own required_similarity.
 
         Args:
             prompt: The user's message text.
@@ -136,27 +139,44 @@ class CacheEngine:
         # Step 2: Embed the prompt.
         embedding = await self._embedder.embed(prompt)
 
-        # Step 3: Search the vector store.
+        # Step 3: Search the vector store at the FLOOR threshold.
+        # We use the most permissive threshold so we never miss a candidate
+        # that some intent category would have accepted.
         result = await self._store.search(
             embedding=embedding,
             namespace=namespace,
-            threshold=policy.similarity_threshold,
+            threshold=FLOOR_THRESHOLD,
         )
 
         if result is not None:
             entry, similarity = result
+
+            # Step 4: Per-entry adaptive threshold check.
+            # The entry knows its own required similarity (set by the
+            # classifier when it was stored). We check it HERE, in Python,
+            # not in Redis — one round trip, zero extra latency.
+            if similarity >= entry.required_similarity:
+                logger.info(
+                    "Cache HIT (similarity=%.4f, required=%.2f) for prompt: %s",
+                    similarity,
+                    entry.required_similarity,
+                    prompt[:50],
+                )
+                return LookupResult(
+                    hit=True,
+                    entry=entry,
+                    similarity=similarity,
+                    namespace=namespace,
+                    embedding=embedding,
+                    policy=policy,
+                )
+
+            # Candidate found but didn't meet its own threshold.
             logger.info(
-                "Cache HIT (similarity=%.4f) for prompt: %s",
+                "Cache NEAR-MISS (similarity=%.4f < required=%.2f) for prompt: %s",
                 similarity,
+                entry.required_similarity,
                 prompt[:50],
-            )
-            return LookupResult(
-                hit=True,
-                entry=entry,
-                similarity=similarity,
-                namespace=namespace,
-                embedding=embedding,
-                policy=policy,
             )
 
         logger.info("Cache MISS for prompt: %s", prompt[:50])
@@ -175,6 +195,7 @@ class CacheEngine:
         model: str,
         response_metadata: dict | None = None,
         ttl_seconds: int | None = None,
+        policy: CachePolicy | None = None,
     ) -> str:
         """
         Store a new response in the cache after a miss.
@@ -191,6 +212,8 @@ class CacheEngine:
             model: The model that generated the response.
             response_metadata: Optional metadata (token counts, etc.).
             ttl_seconds: Override TTL (or use policy default).
+            policy: Override policy (from classifier). Sets both TTL
+                    and required_similarity on the stored entry.
 
         Returns:
             The unique ID of the stored cache entry.
@@ -204,13 +227,14 @@ class CacheEngine:
                 "This happens when the policy was NO_CACHE."
             )
 
-        # Determine TTL: explicitly provided > policy attached to lookup > engine default
+        # Resolve the policy: explicitly provided > lookup result > engine default
+        resolved_policy = policy or lookup_result.policy or self._default_policy
+
+        # Determine TTL: explicitly provided > resolved policy
         if ttl_seconds is not None:
             final_ttl = ttl_seconds
-        elif lookup_result.policy is not None:
-            final_ttl = lookup_result.policy.ttl_seconds
         else:
-            final_ttl = self._default_policy.ttl_seconds
+            final_ttl = resolved_policy.ttl_seconds
 
         if final_ttl <= 0:
             logger.debug("Skipping store: ttl_seconds is %d (NO_CACHE)", final_ttl)
@@ -224,6 +248,7 @@ class CacheEngine:
             created_at=datetime.now(UTC),
             ttl_seconds=final_ttl,
             hit_count=0,
+            required_similarity=resolved_policy.similarity_threshold,
             response_metadata=response_metadata,
         )
 

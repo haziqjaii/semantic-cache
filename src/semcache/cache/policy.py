@@ -65,8 +65,9 @@ class CachePolicy:
 
 
 # ── Default policies per task type ──────────────────────────
-# These will be used by the TTL classifier (Phase 3) to assign
-# policies based on prompt analysis. For now, we use a sensible default.
+# Used by the IntentClassifier (Phase 3) to map prompt categories
+# to cache behavior. The classifier returns a category string,
+# and we look up the corresponding policy here.
 
 DEFAULT_POLICY = CachePolicy(
     ttl_tier=TTLTier.LONG,
@@ -81,3 +82,10 @@ TASK_POLICIES: dict[str, CachePolicy] = {
     "creative": CachePolicy(ttl_tier=TTLTier.NO_CACHE, similarity_threshold=0.99),
     "classification": CachePolicy(ttl_tier=TTLTier.LONG, similarity_threshold=0.90),
 }
+
+# The most permissive threshold across all policies.
+# Used by engine.lookup() when querying Redis — we always search at this
+# floor so we never miss a candidate that some intent would have accepted.
+# The per-entry required_similarity check happens in Python afterwards.
+FLOOR_THRESHOLD: float = min(p.similarity_threshold for p in TASK_POLICIES.values())
+

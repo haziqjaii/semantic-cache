@@ -57,6 +57,13 @@ class CacheEntry:
     ttl_seconds: int = 86400  # When this entry expires
     hit_count: int = 0  # How many times this entry has been served
 
+    # Per-entry adaptive similarity threshold.
+    # Set by the classifier at store time. During lookup, the engine
+    # compares the candidate's similarity against THIS value, not
+    # a global default. This is what makes thresholds adaptive:
+    #   "The threshold is a property of the cached entry, not of the request."
+    required_similarity: float = 0.95
+
     # Optional: full response metadata (token counts, finish reason, etc.)
     # Stored as a JSON-serializable dict so we can return it to the client.
     response_metadata: dict | None = None

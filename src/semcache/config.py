@@ -39,6 +39,10 @@ class Settings(BaseSettings):
     default_similarity_threshold: float = 0.95
     default_ttl_seconds: int = 86400  # 24 hours
 
+    # ── Classifier ─────────────────────────────────────────
+    classifier_model: str = "gemini-3.5-flash-lite"
+    classifier_timeout_seconds: float = 5.0
+
     # ── Server ──────────────────────────────────────────────
     host: str = "0.0.0.0"
     port: int = 8000
