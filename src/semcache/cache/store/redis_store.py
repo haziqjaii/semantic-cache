@@ -81,10 +81,8 @@ def _build_schema(dims: int) -> dict:
             # within the same namespace. This is crucial for isolation.
             {"name": "namespace", "type": "tag"},
             {"name": "model", "type": "tag"},
-            {"name": "created_at", "type": "text"},
             {"name": "ttl_seconds", "type": "numeric"},
             {"name": "hit_count", "type": "numeric"},
-            {"name": "response_metadata", "type": "text"},
             # The embedding vector — this is what we search against.
             # HNSW = the index algorithm. COSINE = the distance metric.
             {

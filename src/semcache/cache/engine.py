@@ -14,7 +14,7 @@ THE FLOW:
     │  5a. HIT  → return cached response + bump hit counter   │
     │  5b. MISS → return None                                 │
     │      → caller sends to LLM, gets response               │
-    │      → caller calls engine.store() to cache it           │
+    │      → caller calls engine.store() to cache it          │
     └─────────────────────────────────────────────────────────┘
 
 WHY A SEPARATE ENGINE CLASS?
@@ -211,6 +211,10 @@ class CacheEngine:
             final_ttl = lookup_result.policy.ttl_seconds
         else:
             final_ttl = self._default_policy.ttl_seconds
+
+        if final_ttl <= 0:
+            logger.debug("Skipping store: ttl_seconds is %d (NO_CACHE)", final_ttl)
+            return ""
 
         entry = CacheEntry(
             prompt=prompt,
