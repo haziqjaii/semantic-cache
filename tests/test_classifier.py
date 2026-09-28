@@ -42,15 +42,16 @@ class TestClassifierSafe:
     async def test_timeout_falls_back_to_default(self, classifier: IntentClassifier):
         """
         If the classifier times out, classify_safe() should return
-        (DEFAULT_POLICY, 0), not raise.
+        a fallback ClassifierResult, not raise.
         """
         with patch.object(
             classifier, "classify", side_effect=TimeoutError("API timeout")
         ):
-            policy, tokens = await classifier.classify_safe("What is Python?")
+            result = await classifier.classify_safe("What is Python?")
 
-        assert policy == DEFAULT_POLICY
-        assert tokens == 0
+        assert result.policy == DEFAULT_POLICY
+        assert result.tokens == 0
+        assert result.is_fallback is True
 
     @pytest.mark.asyncio
     async def test_generic_exception_falls_back_to_default(
@@ -63,10 +64,11 @@ class TestClassifierSafe:
         with patch.object(
             classifier, "classify", side_effect=RuntimeError("API error")
         ):
-            policy, tokens = await classifier.classify_safe("How do I sort a list?")
+            result = await classifier.classify_safe("How do I sort a list?")
 
-        assert policy == DEFAULT_POLICY
-        assert tokens == 0
+        assert result.policy == DEFAULT_POLICY
+        assert result.tokens == 0
+        assert result.is_fallback is True
 
     @pytest.mark.asyncio
     async def test_successful_classification(self, classifier: IntentClassifier):
@@ -74,16 +76,18 @@ class TestClassifierSafe:
         When classify() succeeds, classify_safe() should return the
         classifier's chosen policy.
         """
+        from semcache.cache.classifier import ClassifierResult
         creative_policy = TASK_POLICIES["creative"]
         with patch.object(
-            classifier, "classify", return_value=(creative_policy, 15)
+            classifier, "classify", return_value=ClassifierResult(policy=creative_policy, tokens=15, is_fallback=False)
         ):
-            policy, tokens = await classifier.classify_safe("Write a poem about rain")
+            result = await classifier.classify_safe("Write a poem about rain")
 
-        assert policy == creative_policy
-        assert policy.ttl_seconds == 0  # NO_CACHE
-        assert policy.similarity_threshold == 0.99
-        assert tokens == 15
+        assert result.policy == creative_policy
+        assert result.policy.ttl_seconds == 0  # NO_CACHE
+        assert result.policy.similarity_threshold == 0.99
+        assert result.tokens == 15
+        assert result.is_fallback is False
 
 
 # ── Adaptive Threshold Tests ─────────────────────────────────
@@ -120,12 +124,14 @@ class TestAdaptiveThresholds:
         lookup_res = await engine.lookup(prompt="Query", model="test-model")
         namespace = lookup_res.namespace
         
+        from datetime import datetime, UTC
+        
         strict_entry = CacheEntry(
             prompt="Factual prompt",
             response="Factual answer",
             model="test-model",
             namespace=namespace,
-            created_at=None,
+            created_at=datetime.now(UTC),
             ttl_seconds=3600,
             hit_count=0,
             required_similarity=0.95
@@ -136,7 +142,7 @@ class TestAdaptiveThresholds:
             response="Classification answer",
             model="test-model",
             namespace=namespace,
-            created_at=None,
+            created_at=datetime.now(UTC),
             ttl_seconds=3600,
             hit_count=0,
             required_similarity=0.90

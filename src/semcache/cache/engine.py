@@ -39,6 +39,7 @@ from semcache.cache.keys import build_namespace
 from semcache.cache.policy import DEFAULT_POLICY, FLOOR_THRESHOLD, CachePolicy
 from semcache.cache.store.base import CacheEntry, VectorStore
 from semcache.embeddings.base import Embedder
+from semcache.metrics import metrics
 
 logger = logging.getLogger(__name__)
 
@@ -182,9 +183,9 @@ class CacheEngine:
                 entry.required_similarity,
                 prompt[:50],
             )
-            # We import metrics here locally to avoid circular imports, or
-            # better yet, we just increment it.
-            from semcache.metrics import metrics
+            
+        # If we got here and candidates existed, none of them passed their threshold
+        if candidates:
             metrics.cache_near_misses += 1
 
         logger.info("Cache MISS for prompt: %s", prompt[:50])

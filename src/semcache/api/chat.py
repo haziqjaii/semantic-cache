@@ -130,14 +130,18 @@ async def chat_completions(
 
     # If the classifier failed (despite classify_safe's try/except),
     # or returned an unexpected type, fall back to DEFAULT_POLICY.
+    from semcache.cache.classifier import ClassifierResult
     if isinstance(classify_result, BaseException):
         logger.warning("Classifier raised in gather: %s", classify_result)
         resolved_policy: CachePolicy = DEFAULT_POLICY
         metrics.classifier_calls_fallback += 1
-    elif isinstance(classify_result, tuple) and len(classify_result) == 2 and isinstance(classify_result[0], CachePolicy):
-        resolved_policy, classifier_tokens = classify_result
-        metrics.classifier_calls_success += 1
-        metrics.classifier_tokens_total += classifier_tokens
+    elif isinstance(classify_result, ClassifierResult):
+        resolved_policy = classify_result.policy
+        metrics.classifier_tokens_total += classify_result.tokens
+        if classify_result.is_fallback:
+            metrics.classifier_calls_fallback += 1
+        else:
+            metrics.classifier_calls_success += 1
     else:
         logger.warning("Classifier returned unexpected type: %s", type(classify_result))
         resolved_policy = DEFAULT_POLICY

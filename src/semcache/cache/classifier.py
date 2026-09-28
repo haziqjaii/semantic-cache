@@ -78,6 +78,15 @@ Respond with ONLY the category name, nothing else.
 """
 
 
+from dataclasses import dataclass
+
+@dataclass
+class ClassifierResult:
+    policy: CachePolicy
+    tokens: int
+    is_fallback: bool
+
+
 class IntentClassifier:
     """
     Classifies prompts into intent categories using gemini-3.5-flash-lite.
@@ -96,7 +105,7 @@ class IntentClassifier:
         self._model = model
         self._timeout = timeout_seconds
 
-    async def classify(self, prompt: str) -> tuple[CachePolicy, int]:
+    async def classify(self, prompt: str) -> ClassifierResult:
         """
         Classify a prompt and return the corresponding CachePolicy.
 
@@ -107,7 +116,7 @@ class IntentClassifier:
             prompt: The user's message text.
 
         Returns:
-            A tuple of (CachePolicy, total_tokens_used).
+            A ClassifierResult containing the policy and tokens used.
 
         Raises:
             Any exception from the Gemini SDK, asyncio timeout, etc.
@@ -136,10 +145,8 @@ class IntentClassifier:
             timeout=self._timeout,
         )
 
-        # Extract tokens used
-        tokens = 0
-        if response.usage_metadata:
-            tokens = response.usage_metadata.total_token_count
+        # Extract tokens used (safely handling None)
+        tokens = (response.usage_metadata.total_token_count or 0) if response.usage_metadata else 0
 
         # Parse the structured output.
         import json
@@ -153,9 +160,9 @@ class IntentClassifier:
         logger.info("Classified prompt as '%s' → TTL=%ds, threshold=%.2f (tokens: %d)",
                      category_str, policy.ttl_seconds, policy.similarity_threshold, tokens)
 
-        return policy, tokens
+        return ClassifierResult(policy=policy, tokens=tokens, is_fallback=False)
 
-    async def classify_safe(self, prompt: str) -> tuple[CachePolicy, int]:
+    async def classify_safe(self, prompt: str) -> ClassifierResult:
         """
         Safe wrapper around classify() that NEVER raises.
 
@@ -169,4 +176,4 @@ class IntentClassifier:
             return await self.classify(prompt)
         except Exception:
             logger.exception("Classifier failed, falling back to DEFAULT_POLICY")
-            return DEFAULT_POLICY, 0
+            return ClassifierResult(policy=DEFAULT_POLICY, tokens=0, is_fallback=True)
