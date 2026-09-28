@@ -23,7 +23,18 @@ class ChatCompletionRequest(BaseModel):
     stream: bool | None = False
     # If tools/functions are provided, we will skip caching.
     tools: list[Any] | None = None
-    
+
+    @property
+    def system_prompt(self) -> str | None:
+        """
+        All system messages joined in order, or None if there are none.
+
+        The cache namespace and the provider must both use this, so the
+        cache key always matches the instruction the model actually received.
+        """
+        parts = [m.content for m in self.messages if m.role == "system"]
+        return "\n\n".join(parts) if parts else None
+
     @property
     def is_cacheable(self) -> bool:
         """

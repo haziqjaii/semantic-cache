@@ -64,6 +64,20 @@ PRICING_TABLE = {
     },
 }
 
+
+def estimate_cost_usd(model: str, input_tokens: int, output_tokens: int = 0) -> float | None:
+    """
+    Estimated USD cost of a call, priced per million tokens from PRICING_TABLE.
+
+    Returns None for models missing from the table, so callers can report
+    them as unpriced instead of silently pricing them as some other model.
+    """
+    price = PRICING_TABLE["models"].get(model)
+    if price is None:
+        return None
+    return (input_tokens * price["input"] + output_tokens * price["output"]) / 1_000_000
+
+
 @lru_cache
 def get_settings() -> Settings:
     """

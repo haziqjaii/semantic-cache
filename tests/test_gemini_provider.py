@@ -61,3 +61,69 @@ async def test_joins_text_parts_and_skips_thoughts():
         ]
     )
     assert await _generate_text(response) == "Python is a language."
+
+
+async def _generate(response: types.GenerateContentResponse, request: ChatCompletionRequest | None = None):
+    request = request or ChatCompletionRequest(
+        model="gemini-3.5-flash",
+        messages=[ChatMessage(role="user", content="Hello")],
+    )
+    provider = _provider_returning(response)
+    result = await provider.generate(request)
+    return result, provider._client.aio.models.generate_content
+
+
+def _finished(reason: str) -> types.GenerateContentResponse:
+    return types.GenerateContentResponse(
+        candidates=[
+            types.Candidate(
+                content=types.Content(role="model", parts=[types.Part(text="Hi")]),
+                finish_reason=reason,
+            )
+        ]
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("gemini_reason", "openai_reason"),
+    [
+        ("STOP", "stop"),
+        ("MAX_TOKENS", "length"),
+        ("SAFETY", "content_filter"),
+        ("RECITATION", "content_filter"),
+        # No OpenAI equivalent: passed through, and never reported as "stop".
+        ("OTHER", "other"),
+    ],
+)
+async def test_finish_reason_is_mapped(gemini_reason, openai_reason):
+    result, _ = await _generate(_finished(gemini_reason))
+    assert result.choices[0].finish_reason == openai_reason
+
+
+@pytest.mark.asyncio
+async def test_blocked_prompt_reports_content_filter():
+    response = types.GenerateContentResponse(
+        candidates=[],
+        prompt_feedback=types.GenerateContentResponsePromptFeedback(block_reason="SAFETY"),
+    )
+    result, _ = await _generate(response)
+    assert result.choices[0].finish_reason == "content_filter"
+
+
+@pytest.mark.asyncio
+async def test_all_system_messages_become_the_system_instruction():
+    request = ChatCompletionRequest(
+        model="gemini-3.5-flash",
+        messages=[
+            ChatMessage(role="system", content="You are a teacher."),
+            ChatMessage(role="system", content="Answer in French."),
+            ChatMessage(role="user", content="What is Python?"),
+        ],
+    )
+
+    _, generate_content = await _generate(_finished("STOP"), request)
+
+    kwargs = generate_content.call_args.kwargs
+    assert kwargs["config"].system_instruction == "You are a teacher.\n\nAnswer in French."
+    assert [c.role for c in kwargs["contents"]] == ["user"]

@@ -27,6 +27,7 @@ from semcache.api.dependencies import get_classifier, get_engine, get_provider
 from semcache.cache.classifier import ClassifierResult, IntentClassifier
 from semcache.cache.engine import CacheEngine
 from semcache.cache.policy import CachePolicy
+from semcache.config import estimate_cost_usd
 from semcache.metrics import REQUEST_DURATION, metrics
 from semcache.providers.base import LLMProvider
 from semcache.schemas import (
@@ -42,7 +43,7 @@ router = APIRouter()
 
 
 def _record_llm_usage(response: ChatCompletionResponse, *, cacheable: bool) -> None:
-    """Count an LLM call and its tokens, on every path that calls the provider."""
+    """Count an LLM call, its tokens, and its cost, on every path that calls the provider."""
     prompt_tokens = response.usage.prompt_tokens if response.usage else 0
     completion_tokens = response.usage.completion_tokens if response.usage else 0
 
@@ -50,10 +51,18 @@ def _record_llm_usage(response: ChatCompletionResponse, *, cacheable: bool) -> N
     metrics.llm_tokens_prompt += prompt_tokens
     metrics.llm_tokens_completion += completion_tokens
 
+    cost = estimate_cost_usd(response.model, prompt_tokens, completion_tokens)
+    if cost is None:
+        if response.model not in metrics.llm_unpriced_models:
+            logger.warning("No pricing for model '%s'; its cost is excluded from analytics", response.model)
+        metrics.llm_calls_unpriced += 1
+        metrics.llm_unpriced_models.add(response.model)
+        return
+
+    metrics.llm_cost_usd += cost
     if cacheable:
         metrics.llm_calls_cacheable += 1
-        metrics.llm_tokens_prompt_cacheable += prompt_tokens
-        metrics.llm_tokens_completion_cacheable += completion_tokens
+        metrics.llm_cost_usd_cacheable += cost
 
 
 async def _generate_uncached(
@@ -98,9 +107,7 @@ async def chat_completions(
             return response
 
         # Extract the user prompt and system prompt for the cache engine
-        system_prompt = next(
-            (m.content for m in request.messages if m.role == "system"), None
-        )
+        system_prompt = request.system_prompt
         user_prompt = next(
             (m.content for m in request.messages if m.role == "user"), ""
         )
@@ -190,11 +197,18 @@ async def chat_completions(
             metrics.classifier_calls_fallback += 1
 
         # 5. Store the new response with the classifier's policy
-        generated_text = response.choices[0].message.content
+        choice = response.choices[0]
+        generated_text = choice.message.content
 
-        if not generated_text.strip():
-            # Blocked or empty generations must not be served to future users.
-            logger.warning("Not caching empty response for prompt: %s", user_prompt[:50])
+        if choice.finish_reason != "stop" or not generated_text.strip():
+            # Truncated, filtered, or empty generations must not be served to
+            # future users (cache hits always report finish_reason="stop").
+            logger.warning(
+                "Not caching response (finish_reason=%s, empty=%s) for prompt: %s",
+                choice.finish_reason,
+                not generated_text.strip(),
+                user_prompt[:50],
+            )
         elif lookup_result.embedding is not None:
             try:
                 await engine.store(

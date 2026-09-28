@@ -8,7 +8,8 @@ from fastapi.responses import JSONResponse
 from semcache.api import chat
 from semcache.api.admin import router as admin_router
 from semcache.api.dependencies import lifespan
-from semcache.api.monitoring import metrics_app, router as monitoring_router
+from semcache.api.monitoring import metrics_app
+from semcache.api.monitoring import router as monitoring_router
 
 app = FastAPI(
     title="Semantic Cache",

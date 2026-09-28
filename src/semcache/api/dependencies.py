@@ -2,6 +2,8 @@
 FastAPI dependencies for injecting singletons (Engine, Provider, Classifier).
 """
 
+import asyncio
+import logging
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
@@ -13,13 +15,51 @@ from semcache.cache.policy import CachePolicy, TTLTier
 from semcache.cache.store.redis_store import RedisVectorStore
 from semcache.config import get_settings
 from semcache.embeddings.gemini import GeminiEmbedder
+from semcache.metrics import CacheMetricsCollector
 from semcache.providers.base import LLMProvider
 from semcache.providers.gemini import GeminiProvider
+
+logger = logging.getLogger(__name__)
+
+GAUGE_REFRESH_SECONDS = 15
 
 # Global references for our singletons
 _engine: CacheEngine | None = None
 _provider: LLMProvider | None = None
 _classifier: IntentClassifier | None = None
+
+
+async def refresh_cache_gauges(engine: CacheEngine) -> None:
+    """Copy live store stats into the Prometheus gauges."""
+    stats = await engine.stats()
+    CacheMetricsCollector._cache_entries = stats.get("total_entries", 0)
+    CacheMetricsCollector._evicted_keys = stats.get("evicted_keys", 0)
+    CacheMetricsCollector._expired_keys = stats.get("expired_keys", 0)
+
+
+async def gauge_refresh_loop(engine: CacheEngine) -> None:
+    """
+    Refresh the gauges forever (until cancelled on shutdown).
+
+    Failures are logged once when they start and once when they recover,
+    so a long Redis outage doesn't flood the log every 15 seconds.
+    """
+    failing = False
+    while True:
+        try:
+            await refresh_cache_gauges(engine)
+        except Exception:
+            if not failing:
+                logger.exception(
+                    "Failed to refresh cache gauges; retrying every %ds",
+                    GAUGE_REFRESH_SECONDS,
+                )
+            failing = True
+        else:
+            if failing:
+                logger.info("Cache gauge refresh recovered")
+            failing = False
+        await asyncio.sleep(GAUGE_REFRESH_SECONDS)
 
 
 @asynccontextmanager
@@ -74,27 +114,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         timeout_seconds=settings.classifier_timeout_seconds,
         default_policy=default_policy,
     )
-    
+
     # 6. Start background task for Prometheus gauges
-    import asyncio
-    from semcache.metrics import CacheMetricsCollector
-    
-    async def update_gauges():
-        while True:
-            try:
-                # Get total entries
-                stats = await _engine.stats()
-                CacheMetricsCollector._cache_entries = stats.get("total_entries", 0)
-                
-                # Get evicted and expired keys from Redis INFO
-                info = await _engine._store._redis.info("stats")
-                CacheMetricsCollector._evicted_keys = info.get("evicted_keys", 0)
-                CacheMetricsCollector._expired_keys = info.get("expired_keys", 0)
-            except Exception:
-                pass
-            await asyncio.sleep(15)
-            
-    task = asyncio.create_task(update_gauges())
+    task = asyncio.create_task(gauge_refresh_loop(_engine))
 
     yield  # App runs here
 

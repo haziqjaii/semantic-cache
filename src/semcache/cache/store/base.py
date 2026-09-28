@@ -139,3 +139,11 @@ class VectorStore(ABC):
 
         Used for monitoring and admin endpoints.
         """
+
+    async def backend_stats(self) -> dict:
+        """
+        Backend-specific counters for monitoring (e.g. evicted/expired keys).
+
+        Optional: stores with nothing to report keep this default.
+        """
+        return {}
