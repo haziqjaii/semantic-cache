@@ -72,6 +72,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         api_key=settings.gemini_api_key,
         model=settings.classifier_model,
         timeout_seconds=settings.classifier_timeout_seconds,
+        default_policy=default_policy,
     )
     
     # 6. Start background task for Prometheus gauges

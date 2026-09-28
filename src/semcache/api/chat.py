@@ -10,7 +10,10 @@ This is the user-facing API. Every request flows through here:
 
 The classifier runs concurrently with the main LLM via asyncio.gather,
 so it adds ZERO user-facing latency. If the classifier fails for any
-reason, we fall back to DEFAULT_POLICY — the user never notices.
+reason, we fall back to the engine's default policy — the user never notices.
+
+The cache is an optimization, never a dependency: if Redis or the embedding
+API fails during lookup or store, the user still gets the LLM's answer.
 """
 
 import asyncio
@@ -23,7 +26,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from semcache.api.dependencies import get_classifier, get_engine, get_provider
 from semcache.cache.classifier import ClassifierResult, IntentClassifier
 from semcache.cache.engine import CacheEngine
-from semcache.cache.policy import DEFAULT_POLICY, CachePolicy
+from semcache.cache.policy import CachePolicy
 from semcache.metrics import REQUEST_DURATION, metrics
 from semcache.providers.base import LLMProvider
 from semcache.schemas import (
@@ -36,6 +39,32 @@ from semcache.schemas import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _record_llm_usage(response: ChatCompletionResponse, *, cacheable: bool) -> None:
+    """Count an LLM call and its tokens, on every path that calls the provider."""
+    prompt_tokens = response.usage.prompt_tokens if response.usage else 0
+    completion_tokens = response.usage.completion_tokens if response.usage else 0
+
+    metrics.llm_calls += 1
+    metrics.llm_tokens_prompt += prompt_tokens
+    metrics.llm_tokens_completion += completion_tokens
+
+    if cacheable:
+        metrics.llm_calls_cacheable += 1
+        metrics.llm_tokens_prompt_cacheable += prompt_tokens
+        metrics.llm_tokens_completion_cacheable += completion_tokens
+
+
+async def _generate_uncached(
+    request: ChatCompletionRequest, provider: LLMProvider
+) -> ChatCompletionResponse:
+    """Generate straight from the LLM, with no cache read or write."""
+    # Nothing will be stored, so a classifier call would be wasted.
+    metrics.classifier_calls_skipped += 1
+    response = await provider.generate(request)
+    _record_llm_usage(response, cacheable=request.is_cacheable)
+    return response
 
 
 @router.post("/chat/completions", response_model=ChatCompletionResponse)
@@ -62,10 +91,8 @@ async def chat_completions(
 
         # 1. Option A: Should we cache this at all?
         if not request.is_cacheable:
-            # Don't waste a classifier call on uncacheable requests.
             metrics.cache_bypasses += 1
-            metrics.classifier_calls_skipped += 1
-            response = await provider.generate(request)
+            response = await _generate_uncached(request, provider)
             response.x_cache_status = "BYPASS (Uncacheable)"
             cache_status = "bypass"
             return response
@@ -82,13 +109,22 @@ async def chat_completions(
             raise HTTPException(status_code=400, detail="No user message provided.")
 
         # 2. Check the Cache (uses FLOOR_THRESHOLD + per-entry required_similarity)
-        lookup_result = await engine.lookup(
-            prompt=user_prompt,
-            model=request.model,
-            system_prompt=system_prompt,
-            temperature=request.temperature,
-            max_tokens=request.max_tokens,
-        )
+        try:
+            lookup_result = await engine.lookup(
+                prompt=user_prompt,
+                model=request.model,
+                system_prompt=system_prompt,
+                temperature=request.temperature,
+                max_tokens=request.max_tokens,
+            )
+        except Exception:
+            # Embedding API or Redis is down. Serve the request without the cache.
+            logger.exception("Cache lookup failed, serving uncached response")
+            metrics.cache_lookup_errors += 1
+            response = await _generate_uncached(request, provider)
+            response.x_cache_status = "BYPASS (Cache error)"
+            cache_status = "cache_error"
+            return response
 
         # 3. Cache HIT
         if lookup_result.hit and lookup_result.entry:
@@ -133,12 +169,13 @@ async def chat_completions(
             raise gen_result
 
         response: ChatCompletionResponse = gen_result
+        _record_llm_usage(response, cacheable=True)
 
         # If the classifier failed (despite classify_safe's try/except),
-        # or returned an unexpected type, fall back to DEFAULT_POLICY.
+        # or returned an unexpected type, fall back to the engine's default.
         if isinstance(classify_result, BaseException):
             logger.warning("Classifier raised in gather: %s", classify_result)
-            resolved_policy: CachePolicy = DEFAULT_POLICY
+            resolved_policy: CachePolicy = engine.default_policy
             metrics.classifier_calls_fallback += 1
         elif isinstance(classify_result, ClassifierResult):
             resolved_policy = classify_result.policy
@@ -149,27 +186,29 @@ async def chat_completions(
                 metrics.classifier_calls_success += 1
         else:
             logger.warning("Classifier returned unexpected type: %s", type(classify_result))
-            resolved_policy = DEFAULT_POLICY
+            resolved_policy = engine.default_policy
             metrics.classifier_calls_fallback += 1
 
         # 5. Store the new response with the classifier's policy
         generated_text = response.choices[0].message.content
 
-        if lookup_result.embedding is not None:
-            await engine.store(
-                lookup_result=lookup_result,
-                prompt=user_prompt,
-                response=generated_text,
-                model=request.model,
-                policy=resolved_policy,
-            )
+        if not generated_text.strip():
+            # Blocked or empty generations must not be served to future users.
+            logger.warning("Not caching empty response for prompt: %s", user_prompt[:50])
+        elif lookup_result.embedding is not None:
+            try:
+                await engine.store(
+                    lookup_result=lookup_result,
+                    prompt=user_prompt,
+                    response=generated_text,
+                    model=request.model,
+                    policy=resolved_policy,
+                )
+            except Exception:
+                # The user already has their answer; losing one cache write is fine.
+                logger.exception("Cache store failed, returning uncached response")
+                metrics.cache_store_errors += 1
 
-        # Track LLM usage
-        metrics.llm_calls += 1
-        if response.usage:
-            metrics.llm_tokens_prompt += response.usage.prompt_tokens
-            metrics.llm_tokens_completion += response.usage.completion_tokens
-            
         cache_status = "miss"
         return response
 

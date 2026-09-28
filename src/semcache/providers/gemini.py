@@ -72,9 +72,16 @@ class GeminiProvider(LLMProvider):
                 total_tokens=response.usage_metadata.total_token_count or 0,
             )
 
+        # A blocked or empty response can have no candidates, or a candidate
+        # whose content is None. Join every text part, skipping thought
+        # summaries and non-text parts (e.g. function calls).
         text_content = ""
-        if response.candidates and response.candidates[0].content.parts:
-            text_content = response.candidates[0].content.parts[0].text
+        candidate = response.candidates[0] if response.candidates else None
+        if candidate and candidate.content and candidate.content.parts:
+            text_content = "".join(
+                part.text for part in candidate.content.parts
+                if part.text and not part.thought
+            )
 
         return ChatCompletionResponse(
             id=f"chatcmpl-{uuid.uuid4().hex[:12]}",

@@ -20,6 +20,8 @@ from semcache.cache.policy import (
     DEFAULT_POLICY,
     FLOOR_THRESHOLD,
     TASK_POLICIES,
+    CachePolicy,
+    TTLTier,
 )
 from semcache.cache.store.base import CacheEntry
 from tests.conftest import InMemoryVectorStore, MockEmbedder
@@ -65,6 +67,20 @@ class TestClassifierSafe:
 
         assert result.policy == DEFAULT_POLICY
         assert result.tokens == 0
+        assert result.is_fallback is True
+
+    @pytest.mark.asyncio
+    async def test_fallback_uses_configured_default_policy(self):
+        """A configured default policy (from settings) wins over DEFAULT_POLICY."""
+        configured = CachePolicy(ttl_tier=TTLTier.MEDIUM, similarity_threshold=0.97)
+        classifier = IntentClassifier(api_key="fake-key", default_policy=configured)
+
+        with patch.object(
+            classifier, "classify", side_effect=RuntimeError("API error")
+        ):
+            result = await classifier.classify_safe("What is Python?")
+
+        assert result.policy is configured
         assert result.is_fallback is True
 
     @pytest.mark.asyncio
