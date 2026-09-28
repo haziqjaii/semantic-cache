@@ -21,7 +21,7 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException
 
 from semcache.api.dependencies import get_classifier, get_engine, get_provider
-from semcache.cache.classifier import IntentClassifier
+from semcache.cache.classifier import ClassifierResult, IntentClassifier
 from semcache.cache.engine import CacheEngine
 from semcache.cache.policy import DEFAULT_POLICY, CachePolicy
 from semcache.metrics import metrics
@@ -130,7 +130,6 @@ async def chat_completions(
 
     # If the classifier failed (despite classify_safe's try/except),
     # or returned an unexpected type, fall back to DEFAULT_POLICY.
-    from semcache.cache.classifier import ClassifierResult
     if isinstance(classify_result, BaseException):
         logger.warning("Classifier raised in gather: %s", classify_result)
         resolved_policy: CachePolicy = DEFAULT_POLICY

@@ -24,9 +24,16 @@ import hashlib
 import numpy as np
 import pytest
 
+from semcache.metrics import metrics
+
+
+@pytest.fixture(autouse=True)
+def reset_metrics():
+    """Reset global metrics singleton before every test."""
+    metrics.reset()
+
 from semcache.cache.store.base import CacheEntry, VectorStore
 from semcache.embeddings.base import Embedder
-
 
 # ── Mock Embedder ───────────────────────────────────────────
 

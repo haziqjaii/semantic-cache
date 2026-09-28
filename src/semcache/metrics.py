@@ -42,6 +42,20 @@ class CacheMetrics:
     llm_tokens_prompt: int = 0
     llm_tokens_completion: int = 0
 
+    def reset(self) -> None:
+        """Reset all counters to 0 (mostly for tests)."""
+        self.cache_hits = 0
+        self.cache_misses = 0
+        self.cache_bypasses = 0
+        self.cache_near_misses = 0
+        self.classifier_calls_success = 0
+        self.classifier_calls_fallback = 0
+        self.classifier_calls_skipped = 0
+        self.classifier_tokens_total = 0
+        self.llm_calls = 0
+        self.llm_tokens_prompt = 0
+        self.llm_tokens_completion = 0
+
 
 # Global singleton — importable from anywhere
 metrics = CacheMetrics()
