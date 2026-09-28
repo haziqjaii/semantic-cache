@@ -4,12 +4,11 @@ Cache policy — TTL tiers and similarity threshold rules.
 This module defines the RULES, not the classification logic.
 Think of it like a rulebook:
   - policy.py says "factual questions get 24h TTL"
-  - ttl_classifier.py (Phase 3) reads a prompt and decides "this IS a factual question"
+  - classifier.py (IntentClassifier) reads a prompt and decides "this IS a factual question"
 
 WHY SEPARATE THEM?
-    The rules rarely change. The classifier will evolve (from simple keywords
-    to ML-based). Separating them means upgrading the classifier never touches
-    the policy definitions.
+    The rules rarely change. The classifier can evolve (a different model,
+    new categories) without touching the policy definitions.
 
 THRESHOLD PHILOSOPHY:
     Higher threshold (0.98) = fewer cache hits, but almost never wrong.

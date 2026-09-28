@@ -8,12 +8,10 @@ from any module (api, engine, classifier) without circular imports.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
-from typing import Generator
+from dataclasses import MISSING, dataclass, field, fields
 
 from prometheus_client import Histogram
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
-from prometheus_client.registry import CollectorRegistry
 
 
 @dataclass
@@ -44,37 +42,28 @@ class CacheMetrics:
     llm_tokens_prompt: int = 0
     llm_tokens_completion: int = 0
 
-    # LLM generation — single-turn (cacheable) requests only. A cache hit
-    # replaces one of these, so /v1/analytics averages over them to estimate
-    # savings; multi-turn bypasses would inflate the average.
+    # Estimated LLM spend, priced per call by the requested model
+    # (see PRICING_TABLE). Calls to models missing from the table are
+    # counted here instead of being priced as some other model.
+    llm_cost_usd: float = 0.0
+    llm_calls_unpriced: int = 0
+    llm_unpriced_models: set[str] = field(default_factory=set)
+
+    # Priced single-turn (cacheable) calls only. A cache hit replaces one of
+    # these, so /v1/analytics averages over them to estimate savings;
+    # multi-turn bypasses would inflate the average.
     llm_calls_cacheable: int = 0
-    llm_tokens_prompt_cacheable: int = 0
-    llm_tokens_completion_cacheable: int = 0
+    llm_cost_usd_cacheable: float = 0.0
 
     # Embedding tracking
     embedding_calls: int = 0
     embedding_tokens_total: int = 0
 
     def reset(self) -> None:
-        """Reset all counters to 0 (mostly for tests)."""
-        self.cache_hits = 0
-        self.cache_misses = 0
-        self.cache_bypasses = 0
-        self.cache_near_misses = 0
-        self.cache_lookup_errors = 0
-        self.cache_store_errors = 0
-        self.classifier_calls_success = 0
-        self.classifier_calls_fallback = 0
-        self.classifier_calls_skipped = 0
-        self.classifier_tokens_total = 0
-        self.llm_calls = 0
-        self.llm_tokens_prompt = 0
-        self.llm_tokens_completion = 0
-        self.llm_calls_cacheable = 0
-        self.llm_tokens_prompt_cacheable = 0
-        self.llm_tokens_completion_cacheable = 0
-        self.embedding_calls = 0
-        self.embedding_tokens_total = 0
+        """Reset every field to its default (mostly for tests)."""
+        for f in fields(self):
+            default = f.default_factory() if f.default_factory is not MISSING else f.default
+            setattr(self, f.name, default)
 
 
 # Global singleton — importable from anywhere
@@ -96,21 +85,6 @@ SIMILARITY_SCORE = Histogram(
     "Similarity score of cache candidates",
     labelnames=["outcome"],
     buckets=(0.88, 0.89, 0.90, 0.91, 0.92, 0.93, 0.94, 0.95, 0.96, 0.97, 0.98, 0.99, 1.0)
-)
-
-CACHE_ENTRIES = GaugeMetricFamily(
-    "semcache_cache_entries",
-    "Total number of entries in the cache"
-)
-
-EVICTED_KEYS = GaugeMetricFamily(
-    "semcache_evicted_keys_total",
-    "Total keys evicted from cache by Redis"
-)
-
-EXPIRED_KEYS = GaugeMetricFamily(
-    "semcache_expired_keys_total",
-    "Total keys expired in cache"
 )
 
 

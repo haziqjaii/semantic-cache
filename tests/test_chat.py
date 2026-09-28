@@ -28,14 +28,14 @@ def base_request():
 @pytest.fixture
 def mock_provider():
     provider = MagicMock(spec=LLMProvider)
-    from semcache.schemas import ChatCompletionChoice, ChatCompletionResponse
-    from semcache.schemas import ChatCompletionChoiceMessage as RespMessage
     provider.generate = AsyncMock(return_value=ChatCompletionResponse(
         id="test_id",
         object="chat.completion",
         created=123,
         model="test-model",
-        choices=[ChatCompletionChoice(index=0, message=RespMessage(role="assistant", content="Response"))]
+        choices=[ChatCompletionChoice(
+            index=0, message=ChatCompletionChoiceMessage(role="assistant", content="Response")
+        )]
     ))
     return provider
 
@@ -134,12 +134,23 @@ async def test_chat_completions_cache_hit(base_request, mock_provider, mock_engi
     classifier.classify_safe.assert_not_called()
 
 
-def _response(content: str, prompt_tokens: int = 0, completion_tokens: int = 0):
+def _response(
+    content: str,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    model: str = "gemini-3.5-flash",
+    finish_reason: str = "stop",
+):
     return ChatCompletionResponse(
         id="test_id",
         created=123,
-        model="test-model",
-        choices=[ChatCompletionChoice(message=ChatCompletionChoiceMessage(content=content))],
+        model=model,
+        choices=[
+            ChatCompletionChoice(
+                message=ChatCompletionChoiceMessage(content=content),
+                finish_reason=finish_reason,
+            )
+        ],
         usage=UsageInfo(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
@@ -242,9 +253,10 @@ async def test_bypass_records_llm_usage(mock_provider, mock_engine):
     assert metrics.llm_calls == 1
     assert metrics.llm_tokens_prompt == 100
     assert metrics.llm_tokens_completion == 40
-    # Multi-turn: excluded from the per-hit savings average.
+    # Counted in total spend, but excluded from the per-hit savings average.
+    assert metrics.llm_cost_usd > 0
     assert metrics.llm_calls_cacheable == 0
-    assert metrics.llm_tokens_prompt_cacheable == 0
+    assert metrics.llm_cost_usd_cacheable == 0
 
 
 @pytest.mark.asyncio
@@ -255,5 +267,78 @@ async def test_miss_records_cacheable_llm_usage(base_request, mock_provider, moc
 
     assert metrics.llm_calls == 1
     assert metrics.llm_calls_cacheable == 1
-    assert metrics.llm_tokens_prompt_cacheable == 10
-    assert metrics.llm_tokens_completion_cacheable == 20
+    # gemini-3.5-flash: 10 × $1.50/M + 20 × $9.00/M
+    expected = (10 * 1.50 + 20 * 9.00) / 1_000_000
+    assert metrics.llm_cost_usd_cacheable == pytest.approx(expected)
+
+
+# ── Each call is priced by its own model ────────────────────
+
+@pytest.mark.asyncio
+async def test_calls_are_priced_by_their_own_model(base_request, mock_engine):
+    provider = MagicMock(spec=LLMProvider)
+    provider.generate = AsyncMock(side_effect=[
+        _response("A", 1_000_000, 0, model="gemini-3.5-flash"),       # $1.50
+        _response("B", 1_000_000, 0, model="gemini-3.5-flash-lite"),  # $0.075
+    ])
+
+    await chat_completions(base_request, mock_engine, provider, _classifier())
+    await chat_completions(base_request, mock_engine, provider, _classifier())
+
+    assert metrics.llm_cost_usd == pytest.approx(1.50 + 0.075)
+    assert metrics.llm_calls_unpriced == 0
+
+
+@pytest.mark.asyncio
+async def test_unknown_model_is_counted_as_unpriced(base_request, mock_provider, mock_engine):
+    mock_provider.generate = AsyncMock(
+        return_value=_response("Answer", 10, 20, model="gemini-9-ultra")
+    )
+
+    await chat_completions(base_request, mock_engine, mock_provider, _classifier())
+
+    assert metrics.llm_calls == 1
+    assert metrics.llm_tokens_prompt == 10
+    assert metrics.llm_calls_unpriced == 1
+    assert metrics.llm_unpriced_models == {"gemini-9-ultra"}
+    # Not priced as some other model, and kept out of the savings average.
+    assert metrics.llm_cost_usd == 0
+    assert metrics.llm_calls_cacheable == 0
+
+
+# ── Only normally-finished responses are cached ─────────────
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("finish_reason", ["length", "content_filter", "other"])
+async def test_unfinished_response_is_not_cached(
+    base_request, mock_provider, mock_engine, finish_reason
+):
+    mock_provider.generate = AsyncMock(
+        return_value=_response("Partial answer", finish_reason=finish_reason)
+    )
+
+    response = await chat_completions(base_request, mock_engine, mock_provider, _classifier())
+
+    assert response.choices[0].finish_reason == finish_reason
+    mock_engine.store.assert_not_called()
+
+
+# ── Cache key uses the same system prompt the model gets ────
+
+@pytest.mark.asyncio
+async def test_all_system_messages_form_the_cache_key(mock_provider, mock_engine):
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[
+            ChatMessage(role="system", content="You are a teacher."),
+            ChatMessage(role="system", content="Answer in French."),
+            ChatMessage(role="user", content="What is Python?"),
+        ],
+    )
+
+    await chat_completions(request, mock_engine, mock_provider, _classifier())
+
+    assert (
+        mock_engine.lookup.call_args.kwargs["system_prompt"]
+        == "You are a teacher.\n\nAnswer in French."
+    )

@@ -8,6 +8,7 @@ Run with:
 """
 
 import asyncio
+import os
 
 import pytest
 import pytest_asyncio
@@ -18,7 +19,9 @@ from semcache.cache.store.redis_store import RedisVectorStore
 
 @pytest.fixture
 def redis_url():
-    return "redis://localhost:6379"
+    # These tests FLUSH the database. Point them at a throwaway Redis with
+    # SEMCACHE_TEST_REDIS_URL to keep a dev cache on the default port intact.
+    return os.environ.get("SEMCACHE_TEST_REDIS_URL", "redis://localhost:6379")
 
 
 @pytest_asyncio.fixture
@@ -152,3 +155,13 @@ async def test_hit_counts(store: RedisVectorStore):
     assert result
     hit_entry, _ = result[0]
     assert hit_entry.hit_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_backend_stats(store: RedisVectorStore):
+    """backend_stats reports Redis eviction/expiry counters as ints."""
+    stats = await store.backend_stats()
+
+    assert set(stats) == {"evicted_keys", "expired_keys"}
+    assert all(isinstance(v, int) and v >= 0 for v in stats.values())

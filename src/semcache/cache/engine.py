@@ -313,4 +313,5 @@ class CacheEngine:
         total = await self._store.count()
         return {
             "total_entries": total,
+            **await self._store.backend_stats(),
         }

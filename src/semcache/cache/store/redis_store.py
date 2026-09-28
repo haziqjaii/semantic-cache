@@ -299,6 +299,22 @@ class RedisVectorStore(VectorStore):
         res = await self._redis.ft(INDEX_NAME).search(q)
         return res.total
 
+    async def backend_stats(self) -> dict:
+        """
+        Eviction and expiry counters from Redis INFO.
+
+        These are server-wide: they include any non-semcache keys in the
+        same Redis instance.
+        """
+        if self._redis is None:
+            raise RuntimeError("Store not initialized. Call initialize() first.")
+
+        info = await self._redis.info("stats")
+        return {
+            "evicted_keys": int(info.get("evicted_keys", 0)),
+            "expired_keys": int(info.get("expired_keys", 0)),
+        }
+
     async def close(self) -> None:
         """Close the Redis connection."""
         if self._redis:
