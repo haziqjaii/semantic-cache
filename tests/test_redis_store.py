@@ -165,3 +165,21 @@ async def test_backend_stats(store: RedisVectorStore):
 
     assert set(stats) == {"evicted_keys", "expired_keys"}
     assert all(isinstance(v, int) and v >= 0 for v in stats.values())
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_response_metadata_round_trip(store: RedisVectorStore):
+    """Usage and finish reason stored on a miss come back intact on a hit."""
+    metadata = {
+        "finish_reason": "stop",
+        "usage": {"prompt_tokens": 12, "completion_tokens": 34, "total_tokens": 46},
+    }
+    emb = [1.0, 0.0, 0.0, 0.0]
+    await store.store(
+        emb,
+        CacheEntry(prompt="A", response="A", model="m", namespace="meta_ns", response_metadata=metadata),
+    )
+
+    (entry, _), = await store.search(emb, "meta_ns", threshold=0.9)
+    assert entry.response_metadata == metadata

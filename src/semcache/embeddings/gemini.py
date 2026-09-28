@@ -51,6 +51,10 @@ class GeminiEmbedder(Embedder):
         self._model = model
         self._dims = dims
 
+    @property
+    def model(self) -> str:
+        return self._model
+
     def _normalize(self, values: list[float]) -> list[float]:
         """Normalize vector to unit length so cosine similarity works."""
         vec = np.array(values, dtype=np.float32)

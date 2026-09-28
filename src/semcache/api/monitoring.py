@@ -1,10 +1,10 @@
 import time
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Response
 from fastapi.responses import JSONResponse
-from prometheus_client import REGISTRY, make_asgi_app
+from prometheus_client import CONTENT_TYPE_LATEST, REGISTRY, generate_latest
 
-from semcache.config import PRICING_TABLE, Settings, estimate_cost_usd, get_settings
+from semcache.config import PRICING_TABLE
 from semcache.metrics import CacheMetricsCollector, metrics, process_start_time
 
 # Register custom collector once
@@ -14,16 +14,25 @@ except ValueError:
     # Already registered in tests
     pass
 
-# Create ASGI app for /metrics
-metrics_app = make_asgi_app(registry=REGISTRY)
-
 router = APIRouter()
+
+# Mounted at the root (not under /v1), where Prometheus scrapes by default.
+metrics_router = APIRouter()
+
+
+@metrics_router.get("/metrics", include_in_schema=False)
+def prometheus_metrics() -> Response:
+    """Prometheus exposition, served directly at /metrics (no redirect)."""
+    return Response(generate_latest(REGISTRY), media_type=CONTENT_TYPE_LATEST)
 
 
 @router.get("/analytics")
-async def get_analytics(settings: Settings = Depends(get_settings)):  # noqa: B008
+async def get_analytics():
     """
     Business metrics dashboard computing derived metrics like cost and time saved.
+
+    All costs are estimates in MYR, priced when each call happens (see
+    PRICING_TABLE). The same figures are exported to Prometheus at /metrics.
     """
     total_requests = (
         metrics.cache_hits
@@ -35,24 +44,10 @@ async def get_analytics(settings: Settings = Depends(get_settings)):  # noqa: B0
     cacheable_requests = metrics.cache_hits + metrics.cache_misses
     hit_rate_cacheable = metrics.cache_hits / cacheable_requests if cacheable_requests > 0 else 0
 
-    # Saved cost: each hit replaces one single-turn LLM call, so value hits
-    # at the average cost of those calls (each priced by its own model).
-    # Multi-turn bypasses are excluded; they're typically much longer.
-    cacheable_calls = metrics.llm_calls_cacheable
-    avg_cost_per_call = metrics.llm_cost_usd_cacheable / cacheable_calls if cacheable_calls > 0 else 0
-    saved_cost = avg_cost_per_call * metrics.cache_hits
-
-    # Spent cost: classifier and embedding tokens are tracked as totals, so
-    # (as before) they're priced as input tokens.
-    unpriced_models = set(metrics.llm_unpriced_models)
-    spent_classifier = estimate_cost_usd(settings.classifier_model, metrics.classifier_tokens_total)
-    if spent_classifier is None:
-        unpriced_models.add(settings.classifier_model)
-    spent_embedding = estimate_cost_usd(settings.embedding_model, metrics.embedding_tokens_total)
-    if spent_embedding is None:
-        unpriced_models.add(settings.embedding_model)
-
-    net_cost_saved = saved_cost - (spent_classifier or 0.0) - (spent_embedding or 0.0)
+    # Each hit saved exactly what its cached answer originally cost; the
+    # classifier and embeddings are what the cache itself costs to run.
+    overhead_cost = metrics.classifier_cost_myr + metrics.embedding_cost_myr
+    net_cost_saved = metrics.cost_saved_myr - overhead_cost
 
     # Classifier stats
     total_classifier_calls = metrics.classifier_calls_success + metrics.classifier_calls_fallback
@@ -63,7 +58,10 @@ async def get_analytics(settings: Settings = Depends(get_settings)):  # noqa: B0
         "meta": {
             "since_process_start": True,
             "uptime_seconds": time.time() - process_start_time,
-            "pricing_as_of": PRICING_TABLE["as_of"]
+            "pricing_as_of": PRICING_TABLE["as_of"],
+            "currency": PRICING_TABLE["currency"],
+            "usd_to_myr": PRICING_TABLE["usd_to_myr"],
+            "usd_to_myr_as_of": PRICING_TABLE["usd_to_myr_as_of"],
         },
         "cache": {
             "total_requests": total_requests,
@@ -81,12 +79,16 @@ async def get_analytics(settings: Settings = Depends(get_settings)):  # noqa: B0
             "llm_tokens_completion": metrics.llm_tokens_completion,
             "classifier_tokens": metrics.classifier_tokens_total,
             "embedding_tokens": metrics.embedding_tokens_total,
-            "estimated_llm_cost_usd": metrics.llm_cost_usd,
-            "estimated_cost_saved_usd": saved_cost,
-            "net_cost_saved_usd": net_cost_saved,
-            # Estimates above exclude these (models missing from PRICING_TABLE).
+            "estimated_llm_cost_myr": metrics.llm_cost_myr,
+            "estimated_classifier_cost_myr": metrics.classifier_cost_myr,
+            "estimated_embedding_cost_myr": metrics.embedding_cost_myr,
+            "estimated_cost_saved_myr": metrics.cost_saved_myr,
+            "net_cost_saved_myr": net_cost_saved,
+            # Estimates above exclude these: calls to models missing from
+            # PRICING_TABLE, and hits on entries cached without token counts.
             "unpriced_llm_calls": metrics.llm_calls_unpriced,
-            "unpriced_models": sorted(unpriced_models),
+            "unpriced_cache_hits": metrics.cache_hits_unpriced,
+            "unpriced_models": sorted(metrics.unpriced_models),
         },
         "latency": {
             # Note: We can't compute this exactly from Histograms trivially in Python without parsing buckets.

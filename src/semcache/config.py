@@ -53,9 +53,15 @@ class Settings(BaseSettings):
         case_sensitive=False,      # GEMINI_API_KEY == gemini_api_key
     )
 
-# Static pricing table used for cost savings calculations in /v1/analytics
+# Static pricing table used for all cost figures (/v1/analytics, /metrics).
+# Model prices are in USD per million tokens, as the providers publish them.
+# Every cost we report is converted to Malaysian ringgit (MYR) using
+# usd_to_myr, so update that rate along with the prices.
 PRICING_TABLE = {
     "as_of": "2026-09-28",
+    "currency": "MYR",
+    "usd_to_myr": 4.07,
+    "usd_to_myr_as_of": "2026-09-25",
     "models": {
         "gemini-3.5-flash": {"input": 1.50, "output": 9.00},
         "gemini-3.5-flash-lite": {"input": 0.075, "output": 0.30},
@@ -65,9 +71,9 @@ PRICING_TABLE = {
 }
 
 
-def estimate_cost_usd(model: str, input_tokens: int, output_tokens: int = 0) -> float | None:
+def estimate_cost_myr(model: str, input_tokens: int, output_tokens: int = 0) -> float | None:
     """
-    Estimated USD cost of a call, priced per million tokens from PRICING_TABLE.
+    Estimated cost of a call in MYR, from PRICING_TABLE's USD prices.
 
     Returns None for models missing from the table, so callers can report
     them as unpriced instead of silently pricing them as some other model.
@@ -75,7 +81,8 @@ def estimate_cost_usd(model: str, input_tokens: int, output_tokens: int = 0) -> 
     price = PRICING_TABLE["models"].get(model)
     if price is None:
         return None
-    return (input_tokens * price["input"] + output_tokens * price["output"]) / 1_000_000
+    usd = (input_tokens * price["input"] + output_tokens * price["output"]) / 1_000_000
+    return usd * PRICING_TABLE["usd_to_myr"]
 
 
 @lru_cache

@@ -143,8 +143,14 @@ class CacheEngine:
         )
 
         # Step 2: Embed the prompt.
+        # Token count is estimated (~4 chars/token); the embed API doesn't report it.
+        embedding_tokens = len(prompt) // 4
         metrics.embedding_calls += 1
-        metrics.embedding_tokens_total += len(prompt) // 4
+        metrics.embedding_tokens_total += embedding_tokens
+        if self._embedder.model:
+            cost = metrics.price(self._embedder.model, embedding_tokens)
+            if cost is not None:
+                metrics.embedding_cost_myr += cost
         embedding = await self._embedder.embed(prompt)
 
         # Step 3: Search the vector store at the FLOOR threshold.

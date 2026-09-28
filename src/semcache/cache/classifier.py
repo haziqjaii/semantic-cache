@@ -84,6 +84,8 @@ class ClassifierResult:
     policy: CachePolicy
     tokens: int
     is_fallback: bool
+    # The model that used those tokens, for pricing. None on fallback.
+    model: str | None = None
 
 
 class IntentClassifier:
@@ -164,7 +166,9 @@ class IntentClassifier:
         logger.info("Classified prompt as '%s' → TTL=%ds, threshold=%.2f (tokens: %d)",
                      category_str, policy.ttl_seconds, policy.similarity_threshold, tokens)
 
-        return ClassifierResult(policy=policy, tokens=tokens, is_fallback=False)
+        return ClassifierResult(
+            policy=policy, tokens=tokens, is_fallback=False, model=self._model
+        )
 
     async def classify_safe(self, prompt: str) -> ClassifierResult:
         """
