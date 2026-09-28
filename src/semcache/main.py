@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse
 from semcache.api import chat
 from semcache.api.admin import router as admin_router
 from semcache.api.dependencies import lifespan
-from semcache.api.monitoring import metrics_app
+from semcache.api.monitoring import metrics_router
 from semcache.api.monitoring import router as monitoring_router
 
 app = FastAPI(
@@ -19,7 +19,7 @@ app = FastAPI(
 )
 
 # Register prometheus metrics endpoint
-app.mount("/metrics", metrics_app)
+app.include_router(metrics_router)
 
 # Register API routers
 app.include_router(chat.router, prefix="/v1")

@@ -1,31 +1,22 @@
 import pytest
 from fastapi.testclient import TestClient
 
-from semcache.config import Settings, get_settings
+from semcache.config import PRICING_TABLE, estimate_cost_myr
 from semcache.main import app
-from semcache.metrics import metrics
-
-
-def _test_settings(**overrides) -> Settings:
-    """
-    Explicit settings that ignore .env, so these tests run the same in CI
-    (no .env, no API key) as on a dev machine with a customised .env.
-    """
-    values = {
-        "gemini_api_key": "test-key",
-        "classifier_model": "gemini-3.5-flash-lite",
-        "embedding_model": "gemini-embedding-001",
-    }
-    values.update(overrides)
-    return Settings(_env_file=None, **values)
+from semcache.metrics import REQUEST_DURATION, metrics
 
 
 @pytest.fixture
 def client():
-    # A zero-arg lambda: FastAPI would treat **overrides as a request parameter.
-    app.dependency_overrides[get_settings] = lambda: _test_settings()
-    yield TestClient(app)
-    app.dependency_overrides.clear()
+    return TestClient(app)
+
+
+def test_estimate_cost_is_converted_to_ringgit():
+    # gemini-3.5-flash: 1M input tokens = $1.50
+    assert estimate_cost_myr("gemini-3.5-flash", 1_000_000) == pytest.approx(
+        1.50 * PRICING_TABLE["usd_to_myr"]
+    )
+    assert estimate_cost_myr("not-a-real-model", 1_000_000) is None
 
 
 def test_analytics_math(client):
@@ -41,18 +32,18 @@ def test_analytics_math(client):
     metrics.classifier_calls_skipped = 15
     metrics.classifier_tokens_total = 1000
 
-    # gemini-3.5-flash: $1.50/M input, $9.00/M output.
-    # 5 single-turn misses at 10k/5k tokens = $0.06 each → $0.30,
-    # plus 2 long multi-turn bypasses at 20k/10k tokens = $0.12 each → $0.24.
-    metrics.llm_calls = 7
+    metrics.llm_calls = 10
     metrics.llm_tokens_prompt = 90000
     metrics.llm_tokens_completion = 45000
-    metrics.llm_cost_usd = 0.54
-    metrics.llm_calls_cacheable = 5
-    metrics.llm_cost_usd_cacheable = 0.30
 
     metrics.embedding_calls = 15
     metrics.embedding_tokens_total = 3000
+
+    # Costs are recorded in MYR as calls happen; analytics reports them.
+    metrics.llm_cost_myr = 2.20
+    metrics.cost_saved_myr = 2.50
+    metrics.classifier_cost_myr = 0.01
+    metrics.embedding_cost_myr = 0.04
 
     response = client.get("/v1/analytics")
 
@@ -64,20 +55,19 @@ def test_analytics_math(client):
     assert data["cache"]["hit_rate"] == 0.5  # 10 / 20
     assert data["cache"]["hit_rate_cacheable"] == 10 / 15  # hits / (hits + misses)
 
-    # Total spend includes bypasses.
-    assert data["cost"]["estimated_llm_cost_usd"] == pytest.approx(0.54)
-
-    # Each hit is valued at the average single-turn call: $0.30 / 5 = $0.06.
-    # Saved (hits=10): $0.60. Bypasses don't inflate it.
-    assert data["cost"]["estimated_cost_saved_usd"] == pytest.approx(0.60)
-
-    # Spent cost:
-    # Classifier (flash-lite, $0.075/M input): 1000 tokens = 0.000075
-    # Embedding ($0.15/M input): 3000 tokens = 0.00045
-    net_cost = 0.60 - 0.000075 - 0.00045
-    assert data["cost"]["net_cost_saved_usd"] == pytest.approx(net_cost)
+    # Check cost figures (all MYR)
+    assert data["meta"]["currency"] == "MYR"
+    assert data["meta"]["usd_to_myr"] == PRICING_TABLE["usd_to_myr"]
+    assert data["cost"]["estimated_llm_cost_myr"] == pytest.approx(2.20)
+    assert data["cost"]["estimated_cost_saved_myr"] == pytest.approx(2.50)
+    assert data["cost"]["estimated_classifier_cost_myr"] == pytest.approx(0.01)
+    assert data["cost"]["estimated_embedding_cost_myr"] == pytest.approx(0.04)
+    # Net = saved - (classifier + embedding overhead)
+    assert data["cost"]["net_cost_saved_myr"] == pytest.approx(2.50 - 0.01 - 0.04)
     assert data["cost"]["unpriced_llm_calls"] == 0
+    assert data["cost"]["unpriced_cache_hits"] == 0
     assert data["cost"]["unpriced_models"] == []
+    assert not any(key.endswith("_usd") for key in data["cost"])
 
     # Check classifier stats
     assert data["classifier"]["total_calls"] == 5
@@ -85,31 +75,57 @@ def test_analytics_math(client):
     assert data["classifier"]["fallback_rate"] == 1 / 5
 
 
-def test_analytics_reports_unpriced_models(client):
-    """Models missing from PRICING_TABLE are reported, not priced as another model."""
-    app.dependency_overrides[get_settings] = lambda: _test_settings(
-        classifier_model="some-future-classifier"
-    )
-    metrics.classifier_tokens_total = 1000
+def test_analytics_reports_what_could_not_be_priced(client):
+    """Unpriced models and hits are reported, not priced as something else."""
     metrics.llm_calls_unpriced = 2
-    metrics.llm_unpriced_models = {"gemini-9-ultra"}
+    metrics.cache_hits_unpriced = 3
+    metrics.unpriced_models = {"gemini-9-ultra", "some-future-classifier"}
 
     data = client.get("/v1/analytics").json()
 
     assert data["cost"]["unpriced_llm_calls"] == 2
+    assert data["cost"]["unpriced_cache_hits"] == 3
     assert data["cost"]["unpriced_models"] == ["gemini-9-ultra", "some-future-classifier"]
-    # The unpriced classifier contributes nothing rather than a guessed price.
-    assert data["cost"]["net_cost_saved_usd"] == 0
 
 
 def test_prometheus_metrics_endpoint(client):
     """Test that the Prometheus text format endpoint works."""
     metrics.cache_hits = 42
 
-    response = client.get("/metrics")
+    # Served directly: a scrape target shouldn't redirect (it used to 307 to /metrics/).
+    response = client.get("/metrics", follow_redirects=False)
 
     assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/plain")
     assert "semcache_cache_hits_total 42.0" in response.text
+
+
+def test_prometheus_exports_costs_in_ringgit(client):
+    metrics.cost_saved_myr = 12.5
+    metrics.llm_cost_myr = 30.25
+    metrics.classifier_cost_myr = 0.5
+    metrics.embedding_cost_myr = 0.25
+
+    text = client.get("/metrics").text
+
+    assert "semcache_cost_saved_myr_total 12.5" in text
+    assert "semcache_llm_cost_myr_total 30.25" in text
+    assert 'semcache_overhead_cost_myr_total{component="classifier"} 0.5' in text
+    assert 'semcache_overhead_cost_myr_total{component="embedding"} 0.25' in text
+
+
+def test_prometheus_has_per_model_request_counts(client):
+    """
+    Per-model hit rate comes from the request histogram's _count series,
+    which is labelled by cache_status and model.
+    """
+    REQUEST_DURATION.labels(cache_status="hit", model="per-model-test").observe(0.01)
+    REQUEST_DURATION.labels(cache_status="miss", model="per-model-test").observe(1.0)
+
+    text = client.get("/metrics").text
+
+    assert 'semcache_request_duration_seconds_count{cache_status="hit",model="per-model-test"} 1.0' in text
+    assert 'semcache_request_duration_seconds_count{cache_status="miss",model="per-model-test"} 1.0' in text
 
 
 def test_cache_errors_in_analytics_and_prometheus(client):
@@ -130,11 +146,11 @@ def test_cache_errors_in_analytics_and_prometheus(client):
 
 def test_metrics_reset_restores_every_default():
     metrics.cache_hits = 5
-    metrics.llm_cost_usd = 1.23
-    metrics.llm_unpriced_models.add("some-model")
+    metrics.cost_saved_myr = 1.23
+    metrics.unpriced_models.add("some-model")
 
     metrics.reset()
 
     assert metrics.cache_hits == 0
-    assert metrics.llm_cost_usd == 0.0
-    assert metrics.llm_unpriced_models == set()
+    assert metrics.cost_saved_myr == 0.0
+    assert metrics.unpriced_models == set()

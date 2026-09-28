@@ -7,11 +7,16 @@ from any module (api, engine, classifier) without circular imports.
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import MISSING, dataclass, field, fields
 
 from prometheus_client import Histogram
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
+
+from semcache.config import estimate_cost_myr
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -42,22 +47,36 @@ class CacheMetrics:
     llm_tokens_prompt: int = 0
     llm_tokens_completion: int = 0
 
-    # Estimated LLM spend, priced per call by the requested model
-    # (see PRICING_TABLE). Calls to models missing from the table are
-    # counted here instead of being priced as some other model.
-    llm_cost_usd: float = 0.0
-    llm_calls_unpriced: int = 0
-    llm_unpriced_models: set[str] = field(default_factory=set)
-
-    # Priced single-turn (cacheable) calls only. A cache hit replaces one of
-    # these, so /v1/analytics averages over them to estimate savings;
-    # multi-turn bypasses would inflate the average.
-    llm_calls_cacheable: int = 0
-    llm_cost_usd_cacheable: float = 0.0
-
     # Embedding tracking
     embedding_calls: int = 0
     embedding_tokens_total: int = 0
+
+    # Estimated costs in MYR (see PRICING_TABLE), each priced by the model
+    # that actually served the call, at the moment it happens.
+    llm_cost_myr: float = 0.0
+    classifier_cost_myr: float = 0.0
+    embedding_cost_myr: float = 0.0
+    # Each hit saves exactly what the cached answer originally cost.
+    cost_saved_myr: float = 0.0
+
+    # What couldn't be priced: models missing from PRICING_TABLE, and hits
+    # on entries cached without token counts. Reported, never guessed.
+    llm_calls_unpriced: int = 0
+    cache_hits_unpriced: int = 0
+    unpriced_models: set[str] = field(default_factory=set)
+
+    def price(self, model: str, input_tokens: int, output_tokens: int = 0) -> float | None:
+        """
+        Estimated MYR cost of a call, or None if the model has no pricing.
+
+        Unpriced models are remembered (and logged once) so /v1/analytics
+        can say which figures are incomplete.
+        """
+        cost = estimate_cost_myr(model, input_tokens, output_tokens)
+        if cost is None and model not in self.unpriced_models:
+            logger.warning("No pricing for model '%s'; its cost is excluded from analytics", model)
+            self.unpriced_models.add(model)
+        return cost
 
     def reset(self) -> None:
         """Reset every field to its default (mostly for tests)."""
@@ -129,7 +148,27 @@ class CacheMetricsCollector:
         yield CounterMetricFamily("semcache_embedding_calls_total", "Total embedding API calls", value=metrics.embedding_calls)
         yield CounterMetricFamily("semcache_embedding_tokens_total", "Total embedding tokens", value=metrics.embedding_tokens_total)
 
-        # 5. Gauges (updated via background task)
+        # 5. Estimated costs in MYR. Net savings = saved - overhead.
+        yield CounterMetricFamily(
+            "semcache_cost_saved_myr_total",
+            "Estimated LLM cost avoided by cache hits (MYR)",
+            value=metrics.cost_saved_myr,
+        )
+        yield CounterMetricFamily(
+            "semcache_llm_cost_myr_total",
+            "Estimated LLM generation spend (MYR)",
+            value=metrics.llm_cost_myr,
+        )
+        o = CounterMetricFamily(
+            "semcache_overhead_cost_myr_total",
+            "Estimated cost of running the cache itself (MYR)",
+            labels=["component"],
+        )
+        o.add_metric(["classifier"], metrics.classifier_cost_myr)
+        o.add_metric(["embedding"], metrics.embedding_cost_myr)
+        yield o
+
+        # 6. Gauges (updated via background task)
         g_entries = GaugeMetricFamily("semcache_cache_entries", "Total number of entries in the cache")
         g_entries.add_metric([], self._cache_entries)
         yield g_entries

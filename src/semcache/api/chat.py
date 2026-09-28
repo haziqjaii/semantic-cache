@@ -14,6 +14,9 @@ reason, we fall back to the engine's default policy — the user never notices.
 
 The cache is an optimization, never a dependency: if Redis or the embedding
 API fails during lookup or store, the user still gets the LLM's answer.
+
+Every response carries an X-Cache-Status header (HIT, MISS, or BYPASS), so
+clients can see cache behavior without changing how they parse the body.
 """
 
 import asyncio
@@ -21,13 +24,12 @@ import logging
 import time
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 
 from semcache.api.dependencies import get_classifier, get_engine, get_provider
 from semcache.cache.classifier import ClassifierResult, IntentClassifier
 from semcache.cache.engine import CacheEngine
 from semcache.cache.policy import CachePolicy
-from semcache.config import estimate_cost_usd
 from semcache.metrics import REQUEST_DURATION, metrics
 from semcache.providers.base import LLMProvider
 from semcache.schemas import (
@@ -35,6 +37,7 @@ from semcache.schemas import (
     ChatCompletionChoiceMessage,
     ChatCompletionRequest,
     ChatCompletionResponse,
+    UsageInfo,
 )
 
 logger = logging.getLogger(__name__)
@@ -42,7 +45,22 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-def _record_llm_usage(response: ChatCompletionResponse, *, cacheable: bool) -> None:
+def _set_cache_headers(
+    http_response: Response,
+    status: str,
+    *,
+    similarity: float | None = None,
+    bypass_reason: str | None = None,
+) -> None:
+    """Report cache behavior in headers, as a drop-in proxy should."""
+    http_response.headers["X-Cache-Status"] = status
+    if similarity is not None:
+        http_response.headers["X-Cache-Similarity"] = f"{similarity:.4f}"
+    if bypass_reason is not None:
+        http_response.headers["X-Cache-Bypass-Reason"] = bypass_reason
+
+
+def _record_llm_usage(response: ChatCompletionResponse) -> None:
     """Count an LLM call, its tokens, and its cost, on every path that calls the provider."""
     prompt_tokens = response.usage.prompt_tokens if response.usage else 0
     completion_tokens = response.usage.completion_tokens if response.usage else 0
@@ -51,18 +69,21 @@ def _record_llm_usage(response: ChatCompletionResponse, *, cacheable: bool) -> N
     metrics.llm_tokens_prompt += prompt_tokens
     metrics.llm_tokens_completion += completion_tokens
 
-    cost = estimate_cost_usd(response.model, prompt_tokens, completion_tokens)
+    cost = metrics.price(response.model, prompt_tokens, completion_tokens)
     if cost is None:
-        if response.model not in metrics.llm_unpriced_models:
-            logger.warning("No pricing for model '%s'; its cost is excluded from analytics", response.model)
         metrics.llm_calls_unpriced += 1
-        metrics.llm_unpriced_models.add(response.model)
-        return
+    else:
+        metrics.llm_cost_myr += cost
 
-    metrics.llm_cost_usd += cost
-    if cacheable:
-        metrics.llm_calls_cacheable += 1
-        metrics.llm_cost_usd_cacheable += cost
+
+def _record_cache_saving(model: str, usage: UsageInfo | None) -> None:
+    """Credit a cache hit with the cost of the LLM call it replaced."""
+    saved = metrics.price(model, usage.prompt_tokens, usage.completion_tokens) if usage else None
+    if saved is None:
+        # Entry cached without token counts, or its model has no pricing.
+        metrics.cache_hits_unpriced += 1
+    else:
+        metrics.cost_saved_myr += saved
 
 
 async def _generate_uncached(
@@ -72,13 +93,14 @@ async def _generate_uncached(
     # Nothing will be stored, so a classifier call would be wasted.
     metrics.classifier_calls_skipped += 1
     response = await provider.generate(request)
-    _record_llm_usage(response, cacheable=request.is_cacheable)
+    _record_llm_usage(response)
     return response
 
 
 @router.post("/chat/completions", response_model=ChatCompletionResponse)
 async def chat_completions(
     request: ChatCompletionRequest,
+    http_response: Response,
     engine: CacheEngine = Depends(get_engine),  # noqa: B008
     provider: LLMProvider = Depends(get_provider),  # noqa: B008
     classifier: IntentClassifier = Depends(get_classifier),  # noqa: B008
@@ -103,6 +125,7 @@ async def chat_completions(
             metrics.cache_bypasses += 1
             response = await _generate_uncached(request, provider)
             response.x_cache_status = "BYPASS (Uncacheable)"
+            _set_cache_headers(http_response, "BYPASS", bypass_reason="uncacheable")
             cache_status = "bypass"
             return response
 
@@ -130,13 +153,21 @@ async def chat_completions(
             metrics.cache_lookup_errors += 1
             response = await _generate_uncached(request, provider)
             response.x_cache_status = "BYPASS (Cache error)"
+            _set_cache_headers(http_response, "BYPASS", bypass_reason="cache-error")
             cache_status = "cache_error"
             return response
 
-        # 3. Cache HIT
+        # 3. Cache HIT — replay the stored answer, including its original
+        # token usage and finish reason.
         if lookup_result.hit and lookup_result.entry:
+            entry = lookup_result.entry
+            metadata = entry.response_metadata or {}
+            usage = UsageInfo(**metadata["usage"]) if metadata.get("usage") else None
+
             metrics.cache_hits += 1
             metrics.classifier_calls_skipped += 1  # No classify needed on hit
+            _record_cache_saving(entry.model, usage)
+            _set_cache_headers(http_response, "HIT", similarity=lookup_result.similarity)
             cache_status = "hit"
             return ChatCompletionResponse(
                 id=f"chatcmpl-cached-{uuid.uuid4().hex[:8]}",
@@ -144,12 +175,11 @@ async def chat_completions(
                 model=request.model,
                 choices=[
                     ChatCompletionChoice(
-                        message=ChatCompletionChoiceMessage(
-                            content=lookup_result.entry.response
-                        ),
-                        finish_reason="stop",
+                        message=ChatCompletionChoiceMessage(content=entry.response),
+                        finish_reason=metadata.get("finish_reason", "stop"),
                     )
                 ],
+                usage=usage,
                 x_cache_status=f"HIT (similarity: {lookup_result.similarity:.4f})",
             )
 
@@ -176,7 +206,7 @@ async def chat_completions(
             raise gen_result
 
         response: ChatCompletionResponse = gen_result
-        _record_llm_usage(response, cacheable=True)
+        _record_llm_usage(response)
 
         # If the classifier failed (despite classify_safe's try/except),
         # or returned an unexpected type, fall back to the engine's default.
@@ -187,6 +217,10 @@ async def chat_completions(
         elif isinstance(classify_result, ClassifierResult):
             resolved_policy = classify_result.policy
             metrics.classifier_tokens_total += classify_result.tokens
+            if classify_result.model:
+                classifier_cost = metrics.price(classify_result.model, classify_result.tokens)
+                if classifier_cost is not None:
+                    metrics.classifier_cost_myr += classifier_cost
             if classify_result.is_fallback:
                 metrics.classifier_calls_fallback += 1
             else:
@@ -202,7 +236,7 @@ async def chat_completions(
 
         if choice.finish_reason != "stop" or not generated_text.strip():
             # Truncated, filtered, or empty generations must not be served to
-            # future users (cache hits always report finish_reason="stop").
+            # future users. Only answers that finished normally are cached.
             logger.warning(
                 "Not caching response (finish_reason=%s, empty=%s) for prompt: %s",
                 choice.finish_reason,
@@ -210,12 +244,18 @@ async def chat_completions(
                 user_prompt[:50],
             )
         elif lookup_result.embedding is not None:
+            # Keep what a hit needs to replay the answer faithfully and to
+            # credit the exact cost it saves.
+            response_metadata: dict = {"finish_reason": choice.finish_reason}
+            if response.usage:
+                response_metadata["usage"] = response.usage.model_dump()
             try:
                 await engine.store(
                     lookup_result=lookup_result,
                     prompt=user_prompt,
                     response=generated_text,
                     model=request.model,
+                    response_metadata=response_metadata,
                     policy=resolved_policy,
                 )
             except Exception:
@@ -223,6 +263,7 @@ async def chat_completions(
                 logger.exception("Cache store failed, returning uncached response")
                 metrics.cache_store_errors += 1
 
+        _set_cache_headers(http_response, "MISS")
         cache_status = "miss"
         return response
 
