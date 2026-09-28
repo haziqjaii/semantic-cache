@@ -6,7 +6,9 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 from semcache.api import chat
+from semcache.api.admin import router as admin_router
 from semcache.api.dependencies import lifespan
+from semcache.api.monitoring import metrics_app, router as monitoring_router
 
 app = FastAPI(
     title="Semantic Cache",
@@ -15,9 +17,13 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Register the v1 router
-app.include_router(chat.router, prefix="/v1")
+# Register prometheus metrics endpoint
+app.mount("/metrics", metrics_app)
 
+# Register API routers
+app.include_router(chat.router, prefix="/v1")
+app.include_router(monitoring_router, prefix="/v1")
+app.include_router(admin_router, prefix="/v1/cache")
 
 @app.get("/health")
 async def health_check():

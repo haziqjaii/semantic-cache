@@ -9,23 +9,20 @@ These tests focus on:
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
 import pytest_asyncio
 
 from semcache.cache.classifier import IntentClassifier
-from semcache.cache.engine import CacheEngine, LookupResult
+from semcache.cache.engine import CacheEngine
 from semcache.cache.policy import (
     DEFAULT_POLICY,
     FLOOR_THRESHOLD,
     TASK_POLICIES,
-    CachePolicy,
-    TTLTier,
 )
 from semcache.cache.store.base import CacheEntry
 from tests.conftest import InMemoryVectorStore, MockEmbedder
-
 
 # ── Classifier Tests ─────────────────────────────────────────
 
@@ -110,11 +107,9 @@ class TestAdaptiveThresholds:
         If we only check top-1, we miss the loose entry.
         If we check top-k, we correctly hit the loose entry.
         """
-        from semcache.cache.store.base import CacheEntry
-        from semcache.cache.policy import TASK_POLICIES
-        from tests.conftest import InMemoryVectorStore, MockEmbedder
+
         from semcache.cache.engine import CacheEngine
-        import numpy as np
+        from tests.conftest import InMemoryVectorStore, MockEmbedder
 
         store = InMemoryVectorStore()
         embedder = MockEmbedder(dims=2)  # 2D for simple math
@@ -124,7 +119,7 @@ class TestAdaptiveThresholds:
         lookup_res = await engine.lookup(prompt="Query", model="test-model")
         namespace = lookup_res.namespace
         
-        from datetime import datetime, UTC
+        from datetime import UTC, datetime
         
         strict_entry = CacheEntry(
             prompt="Factual prompt",

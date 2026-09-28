@@ -61,9 +61,14 @@ class GeminiProvider(LLMProvider):
         # 4. Translate Response back to OpenAI format
         usage = None
         if response.usage_metadata:
+            prompt_tokens = response.usage_metadata.prompt_token_count or 0
+            candidates_tokens = response.usage_metadata.candidates_token_count or 0
+            # Thinking models report thought tokens separately from candidates, but both are billed as output.
+            thoughts_tokens = getattr(response.usage_metadata, "thoughts_token_count", 0) or 0
+            
             usage = UsageInfo(
-                prompt_tokens=response.usage_metadata.prompt_token_count or 0,
-                completion_tokens=response.usage_metadata.candidates_token_count or 0,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=candidates_tokens + thoughts_tokens,
                 total_tokens=response.usage_metadata.total_token_count or 0,
             )
 

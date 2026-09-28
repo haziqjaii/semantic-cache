@@ -73,10 +73,36 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         model=settings.classifier_model,
         timeout_seconds=settings.classifier_timeout_seconds,
     )
+    
+    # 6. Start background task for Prometheus gauges
+    import asyncio
+    from semcache.metrics import CacheMetricsCollector
+    
+    async def update_gauges():
+        while True:
+            try:
+                # Get total entries
+                stats = await _engine.stats()
+                CacheMetricsCollector._cache_entries = stats.get("total_entries", 0)
+                
+                # Get evicted and expired keys from Redis INFO
+                info = await _engine._store._redis.info("stats")
+                CacheMetricsCollector._evicted_keys = info.get("evicted_keys", 0)
+                CacheMetricsCollector._expired_keys = info.get("expired_keys", 0)
+            except Exception:
+                pass
+            await asyncio.sleep(15)
+            
+    task = asyncio.create_task(update_gauges())
 
     yield  # App runs here
 
     # Cleanup on shutdown
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
     await store.close()
 
 

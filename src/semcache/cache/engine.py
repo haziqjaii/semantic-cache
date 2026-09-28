@@ -39,7 +39,7 @@ from semcache.cache.keys import build_namespace
 from semcache.cache.policy import DEFAULT_POLICY, FLOOR_THRESHOLD, CachePolicy
 from semcache.cache.store.base import CacheEntry, VectorStore
 from semcache.embeddings.base import Embedder
-from semcache.metrics import metrics
+from semcache.metrics import SIMILARITY_SCORE, metrics
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +138,8 @@ class CacheEngine:
         )
 
         # Step 2: Embed the prompt.
+        metrics.embedding_calls += 1
+        metrics.embedding_tokens_total += len(prompt) // 4
         embedding = await self._embedder.embed(prompt)
 
         # Step 3: Search the vector store at the FLOOR threshold.
@@ -166,6 +168,7 @@ class CacheEngine:
                 
                 # Record the hit in the store
                 await self._store.record_hit(entry.id)
+                SIMILARITY_SCORE.labels(outcome="hit").observe(similarity)
                 
                 return LookupResult(
                     hit=True,
@@ -183,6 +186,7 @@ class CacheEngine:
                 entry.required_similarity,
                 prompt[:50],
             )
+            SIMILARITY_SCORE.labels(outcome="near_miss").observe(similarity)
             
         # If we got here and candidates existed, none of them passed their threshold
         if candidates:

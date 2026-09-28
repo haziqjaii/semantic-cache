@@ -8,9 +8,8 @@ Run with:
 """
 
 import asyncio
-import numpy as np
-import pytest
 
+import pytest
 import pytest_asyncio
 
 from semcache.cache.store.base import CacheEntry

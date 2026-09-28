@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import enum
 import logging
+from dataclasses import dataclass
 
 from google import genai
 from google.genai import types
@@ -77,8 +78,6 @@ exactly one of these categories:
 Respond with ONLY the category name, nothing else.
 """
 
-
-from dataclasses import dataclass
 
 @dataclass
 class ClassifierResult:

@@ -53,6 +53,16 @@ class Settings(BaseSettings):
         case_sensitive=False,      # GEMINI_API_KEY == gemini_api_key
     )
 
+# Static pricing table used for cost savings calculations in /v1/analytics
+PRICING_TABLE = {
+    "as_of": "2026-09-28",
+    "models": {
+        "gemini-3.5-flash": {"input": 1.50, "output": 9.00},
+        "gemini-3.5-flash-lite": {"input": 0.075, "output": 0.30},
+        "gemini-embedding-001": {"input": 0.15, "output": 0.0},
+        "text-embedding-004": {"input": 0.15, "output": 0.0},
+    },
+}
 
 @lru_cache
 def get_settings() -> Settings:
