@@ -27,6 +27,7 @@ async def get_analytics():
         metrics.cache_hits
         + metrics.cache_misses
         + metrics.cache_bypasses
+        + metrics.cache_lookup_errors
     )
     hit_rate = metrics.cache_hits / total_requests if total_requests > 0 else 0
     cacheable_requests = metrics.cache_hits + metrics.cache_misses
@@ -45,9 +46,12 @@ async def get_analytics():
         settings.embedding_model, {"input": 0.15, "output": 0.0}
     )
 
-    # Estimate average LLM tokens per call to figure out what was saved
-    avg_prompt_tokens = metrics.llm_tokens_prompt / metrics.llm_calls if metrics.llm_calls > 0 else 0
-    avg_completion_tokens = metrics.llm_tokens_completion / metrics.llm_calls if metrics.llm_calls > 0 else 0
+    # Estimate average LLM tokens per call to figure out what was saved.
+    # Only single-turn calls count: a hit replaces one of those, not a
+    # (typically much longer) multi-turn bypass.
+    cacheable_calls = metrics.llm_calls_cacheable
+    avg_prompt_tokens = metrics.llm_tokens_prompt_cacheable / cacheable_calls if cacheable_calls > 0 else 0
+    avg_completion_tokens = metrics.llm_tokens_completion_cacheable / cacheable_calls if cacheable_calls > 0 else 0
 
     saved_prompt_tokens = avg_prompt_tokens * metrics.cache_hits
     saved_completion_tokens = avg_completion_tokens * metrics.cache_hits
@@ -81,6 +85,8 @@ async def get_analytics():
             "cache_misses": metrics.cache_misses,
             "cache_bypasses": metrics.cache_bypasses,
             "cache_near_misses": metrics.cache_near_misses,
+            "cache_lookup_errors": metrics.cache_lookup_errors,
+            "cache_store_errors": metrics.cache_store_errors,
             "hit_rate": hit_rate,
             "hit_rate_cacheable": hit_rate_cacheable,
         },

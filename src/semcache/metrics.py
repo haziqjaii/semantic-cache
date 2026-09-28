@@ -30,6 +30,8 @@ class CacheMetrics:
     cache_misses: int = 0
     cache_bypasses: int = 0  # Uncacheable requests (multi-turn, tools)
     cache_near_misses: int = 0  # Found candidate but below required_similarity
+    cache_lookup_errors: int = 0  # Lookup failed; served uncached from the LLM
+    cache_store_errors: int = 0  # Store failed after a miss; response still returned
 
     # Classifier tracking
     classifier_calls_success: int = 0
@@ -37,11 +39,18 @@ class CacheMetrics:
     classifier_calls_skipped: int = 0
     classifier_tokens_total: int = 0
 
-    # LLM generation
+    # LLM generation — every call, including bypasses
     llm_calls: int = 0
     llm_tokens_prompt: int = 0
     llm_tokens_completion: int = 0
-    
+
+    # LLM generation — single-turn (cacheable) requests only. A cache hit
+    # replaces one of these, so /v1/analytics averages over them to estimate
+    # savings; multi-turn bypasses would inflate the average.
+    llm_calls_cacheable: int = 0
+    llm_tokens_prompt_cacheable: int = 0
+    llm_tokens_completion_cacheable: int = 0
+
     # Embedding tracking
     embedding_calls: int = 0
     embedding_tokens_total: int = 0
@@ -52,6 +61,8 @@ class CacheMetrics:
         self.cache_misses = 0
         self.cache_bypasses = 0
         self.cache_near_misses = 0
+        self.cache_lookup_errors = 0
+        self.cache_store_errors = 0
         self.classifier_calls_success = 0
         self.classifier_calls_fallback = 0
         self.classifier_calls_skipped = 0
@@ -59,6 +70,9 @@ class CacheMetrics:
         self.llm_calls = 0
         self.llm_tokens_prompt = 0
         self.llm_tokens_completion = 0
+        self.llm_calls_cacheable = 0
+        self.llm_tokens_prompt_cacheable = 0
+        self.llm_tokens_completion_cacheable = 0
         self.embedding_calls = 0
         self.embedding_tokens_total = 0
 
@@ -117,6 +131,11 @@ class CacheMetricsCollector:
         yield CounterMetricFamily("semcache_cache_misses_total", "Total cache misses", value=metrics.cache_misses)
         yield CounterMetricFamily("semcache_cache_bypasses_total", "Total cache bypasses", value=metrics.cache_bypasses)
         yield CounterMetricFamily("semcache_cache_near_misses_total", "Total cache near misses", value=metrics.cache_near_misses)
+
+        e = CounterMetricFamily("semcache_cache_errors_total", "Total cache backend failures", labels=["stage"])
+        e.add_metric(["lookup"], metrics.cache_lookup_errors)
+        e.add_metric(["store"], metrics.cache_store_errors)
+        yield e
 
         # 2. Classifier calls (using labels for status)
         c = CounterMetricFamily("semcache_classifier_calls_total", "Total classifier calls", labels=["status"])

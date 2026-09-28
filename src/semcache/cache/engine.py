@@ -84,6 +84,11 @@ class CacheEngine:
         self._store = store
         self._default_policy = default_policy or DEFAULT_POLICY
 
+    @property
+    def default_policy(self) -> CachePolicy:
+        """The configured fallback policy (from settings in production)."""
+        return self._default_policy
+
     async def lookup(
         self,
         prompt: str,

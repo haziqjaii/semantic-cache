@@ -99,10 +99,15 @@ class IntentClassifier:
         api_key: str,
         model: str = "gemini-3.5-flash-lite",
         timeout_seconds: float = 5.0,
+        default_policy: CachePolicy | None = None,
     ) -> None:
         self._client = genai.Client(api_key=api_key)
         self._model = model
         self._timeout = timeout_seconds
+        # Used on failure or an unknown category. Pass the engine's
+        # configured default so DEFAULT_SIMILARITY_THRESHOLD / DEFAULT_TTL_SECONDS
+        # actually take effect.
+        self._default_policy = default_policy or DEFAULT_POLICY
 
     async def classify(self, prompt: str) -> ClassifierResult:
         """
@@ -154,7 +159,7 @@ class IntentClassifier:
         category_str = result.get("category", "factual")
 
         # Map to our predefined policies.
-        policy = TASK_POLICIES.get(category_str, DEFAULT_POLICY)
+        policy = TASK_POLICIES.get(category_str, self._default_policy)
 
         logger.info("Classified prompt as '%s' → TTL=%ds, threshold=%.2f (tokens: %d)",
                      category_str, policy.ttl_seconds, policy.similarity_threshold, tokens)
@@ -166,7 +171,7 @@ class IntentClassifier:
         Safe wrapper around classify() that NEVER raises.
 
         If anything goes wrong (timeout, rate limit, malformed output,
-        network error), we log it and return DEFAULT_POLICY and 0 tokens.
+        network error), we log it and return the default policy and 0 tokens.
         The user's request is never affected.
 
         This is what chat.py should always call.
@@ -174,5 +179,5 @@ class IntentClassifier:
         try:
             return await self.classify(prompt)
         except Exception:
-            logger.exception("Classifier failed, falling back to DEFAULT_POLICY")
-            return ClassifierResult(policy=DEFAULT_POLICY, tokens=0, is_fallback=True)
+            logger.exception("Classifier failed, falling back to default policy")
+            return ClassifierResult(policy=self._default_policy, tokens=0, is_fallback=True)

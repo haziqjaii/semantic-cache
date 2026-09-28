@@ -22,10 +22,14 @@ def test_analytics_math():
     metrics.classifier_calls_skipped = 15
     metrics.classifier_tokens_total = 1000
     
-    metrics.llm_calls = 5
-    metrics.llm_tokens_prompt = 50000
-    metrics.llm_tokens_completion = 25000
-    
+    # 5 single-turn misses + 2 long multi-turn bypasses (20k/10k tokens each)
+    metrics.llm_calls = 7
+    metrics.llm_tokens_prompt = 90000
+    metrics.llm_tokens_completion = 45000
+    metrics.llm_calls_cacheable = 5
+    metrics.llm_tokens_prompt_cacheable = 50000
+    metrics.llm_tokens_completion_cacheable = 25000
+
     metrics.embedding_calls = 15
     metrics.embedding_tokens_total = 3000
     
@@ -42,7 +46,10 @@ def test_analytics_math():
     
     # Check cost calculations
     # LLM price: $1.50/M input, $9.00/M output
-    # Avg tokens: 10,000 prompt, 5,000 completion per call
+    # Total spend includes bypasses: (90000 / 1M) * 1.50 + (45000 / 1M) * 9.00 = 0.135 + 0.405
+    assert abs(data["cost"]["estimated_llm_cost_usd"] - 0.54) < 1e-6
+
+    # Avg tokens use cacheable calls only: 10,000 prompt, 5,000 completion per call
     # Saved tokens (hits=10): 100,000 prompt, 50,000 completion
     # Saved LLM cost: (100000 / 1M) * 1.50 + (50000 / 1M) * 9.00 = 0.15 + 0.45 = 0.60
     assert abs(data["cost"]["estimated_cost_saved_usd"] - 0.60) < 1e-6
@@ -69,3 +76,21 @@ def test_prometheus_metrics_endpoint():
     
     assert response.status_code == 200
     assert "semcache_cache_hits_total 42.0" in response.text
+
+
+def test_cache_errors_in_analytics_and_prometheus():
+    """Lookup errors count as requests; both error stages are exported."""
+    metrics.cache_hits = 1
+    metrics.cache_lookup_errors = 1
+    metrics.cache_store_errors = 3
+
+    client = TestClient(app)
+
+    data = client.get("/v1/analytics").json()
+    assert data["cache"]["total_requests"] == 2
+    assert data["cache"]["cache_lookup_errors"] == 1
+    assert data["cache"]["cache_store_errors"] == 3
+
+    text = client.get("/metrics").text
+    assert 'semcache_cache_errors_total{stage="lookup"} 1.0' in text
+    assert 'semcache_cache_errors_total{stage="store"} 3.0' in text
