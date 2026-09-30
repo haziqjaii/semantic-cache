@@ -47,6 +47,11 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8000
 
+    # ── Admin ───────────────────────────────────────────────
+    # When set, cache invalidation requires "Authorization: Bearer <token>".
+    # Unset (the default) leaves it open, which is fine for local use only.
+    admin_token: str | None = None
+
     model_config = SettingsConfigDict(
         env_file=".env",          # auto-load .env file from project root
         env_file_encoding="utf-8",

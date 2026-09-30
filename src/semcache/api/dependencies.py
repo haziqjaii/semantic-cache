@@ -71,6 +71,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     global _engine, _provider, _classifier
 
     settings = get_settings()
+    if settings.admin_token is None:
+        logger.warning(
+            "ADMIN_TOKEN is not set: /v1/cache/invalidate is open to anyone who can "
+            "reach this server. Set it before exposing the proxy beyond localhost."
+        )
 
     # 1. Initialize Vector Store
     store = RedisVectorStore(

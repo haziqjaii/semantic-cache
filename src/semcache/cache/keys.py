@@ -37,6 +37,7 @@ WHY SHA-256?
 
 import hashlib
 import json
+import re
 
 
 def build_namespace(
@@ -79,3 +80,50 @@ def build_namespace(
 
     # Return first 16 chars — enough uniqueness, saves Redis memory.
     return hash_digest[:16]
+
+
+def hash_system_prompt(system_prompt: str | None) -> str:
+    """
+    A 16-char hash of the system prompt alone (None and "" hash the same).
+
+    The namespace mixes the system prompt with model and parameters, so it
+    can't answer "every entry for this system prompt". This hash is stored
+    on each entry for exactly that kind of invalidation.
+    """
+    return hashlib.sha256((system_prompt or "").encode("utf-8")).hexdigest()[:16]
+
+
+# Cache tags: short labels clients attach to entries (X-Cache-Tags header)
+# so they can invalidate them as a group later.
+MAX_CACHE_TAGS = 10
+_TAG_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_.:-]{0,63}$")
+
+
+def normalize_cache_tag(tag: str) -> str:
+    """
+    Lowercase and validate one cache tag.
+
+    Tags are matched case-insensitively (as Redis TAG fields are), so we
+    store them lowercased. Commas are not allowed: they separate tags.
+
+    Raises:
+        ValueError: If the tag is empty or has characters outside
+            letters, digits, '_', '.', ':' and '-' (max 64 chars).
+    """
+    normalized = tag.strip().lower()
+    if not _TAG_PATTERN.match(normalized):
+        raise ValueError(
+            f"Invalid cache tag {tag!r}: use 1-64 letters, digits, '_', '.', ':' or '-', "
+            "starting with a letter or digit."
+        )
+    return normalized
+
+
+def parse_cache_tags(header: str | None) -> list[str]:
+    """Parse a comma-separated tag list ("support, Billing:v2") into sorted, unique tags."""
+    if not header:
+        return []
+    tags = sorted({normalize_cache_tag(t) for t in header.split(",") if t.strip()})
+    if len(tags) > MAX_CACHE_TAGS:
+        raise ValueError(f"At most {MAX_CACHE_TAGS} cache tags are allowed, got {len(tags)}.")
+    return tags

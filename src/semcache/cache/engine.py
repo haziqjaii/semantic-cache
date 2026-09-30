@@ -35,9 +35,9 @@ import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from semcache.cache.keys import build_namespace
+from semcache.cache.keys import build_namespace, hash_system_prompt
 from semcache.cache.policy import DEFAULT_POLICY, FLOOR_THRESHOLD, CachePolicy
-from semcache.cache.store.base import CacheEntry, VectorStore
+from semcache.cache.store.base import CacheEntry, EntryFilter, VectorStore
 from semcache.embeddings.base import Embedder
 from semcache.metrics import SIMILARITY_SCORE, metrics
 
@@ -64,6 +64,7 @@ class LookupResult:
     namespace: str = ""
     embedding: list[float] | None = None  # cached for later store() call
     policy: CachePolicy | None = None
+    system_prompt_hash: str = ""  # stored on the entry for invalidation
 
 
 class CacheEngine:
@@ -134,13 +135,15 @@ class CacheEngine:
             logger.debug("Cache skip: NO_CACHE policy for prompt: %s", prompt[:50])
             return LookupResult(hit=False, namespace="", embedding=None, policy=policy)
 
-        # Step 1: Build the namespace hash.
+        # Step 1: Build the namespace hash (plus the system prompt's own hash,
+        # which store() saves on the entry for invalidation).
         namespace = build_namespace(
             model=model,
             system_prompt=system_prompt,
             temperature=temperature,
             max_tokens=max_tokens,
         )
+        system_prompt_hash = hash_system_prompt(system_prompt)
 
         # Step 2: Embed the prompt.
         # Token count is estimated (~4 chars/token); the embed API doesn't report it.
@@ -188,6 +191,7 @@ class CacheEngine:
                     namespace=namespace,
                     embedding=embedding,
                     policy=policy,
+                    system_prompt_hash=system_prompt_hash,
                 )
 
             # Candidate found but didn't meet its own threshold.
@@ -209,6 +213,7 @@ class CacheEngine:
             namespace=namespace,
             embedding=embedding,
             policy=policy,
+            system_prompt_hash=system_prompt_hash,
         )
 
     async def store(
@@ -220,6 +225,7 @@ class CacheEngine:
         response_metadata: dict | None = None,
         ttl_seconds: int | None = None,
         policy: CachePolicy | None = None,
+        tags: list[str] | None = None,
     ) -> str:
         """
         Store a new response in the cache after a miss.
@@ -238,6 +244,8 @@ class CacheEngine:
             ttl_seconds: Override TTL (or use policy default).
             policy: Override policy (from classifier). Sets both TTL
                     and required_similarity on the stored entry.
+            tags: Labels for invalidating this entry as part of a group
+                  (already normalized; see keys.parse_cache_tags).
 
         Returns:
             The unique ID of the stored cache entry.
@@ -274,6 +282,8 @@ class CacheEngine:
             hit_count=0,
             required_similarity=resolved_policy.similarity_threshold,
             response_metadata=response_metadata,
+            system_prompt_hash=lookup_result.system_prompt_hash,
+            tags=list(tags or []),
         )
 
         entry_id = await self._store.store(
@@ -306,9 +316,32 @@ class CacheEngine:
             temperature=temperature,
             max_tokens=max_tokens,
         )
-        deleted = await self._store.delete_by_namespace(namespace)
-        logger.info("Invalidated %d entries in namespace: %s", deleted, namespace)
+        return await self.invalidate(EntryFilter(namespace=namespace))
+
+    async def invalidate(self, entry_filter: EntryFilter, *, allow_all: bool = False) -> int:
+        """
+        Delete every cache entry matching the filter.
+
+        Use cases:
+          - A system prompt changed: filter by its system_prompt_hash.
+          - A model was upgraded behind the same name: filter by model.
+          - A group of entries went stale: filter by a client tag.
+
+        An empty filter matches the whole cache, so it's refused unless
+        allow_all=True — a missing filter must never wipe everything.
+
+        Returns:
+            Number of entries deleted.
+        """
+        if entry_filter.is_empty() and not allow_all:
+            raise ValueError("Refusing to invalidate with an empty filter; pass allow_all=True.")
+        deleted = await self._store.delete_matching(entry_filter)
+        logger.info("Invalidated %d entries matching %s", deleted, entry_filter.as_dict() or "ALL")
         return deleted
+
+    async def count(self, entry_filter: EntryFilter | None = None) -> int:
+        """Count entries matching a filter (all entries if None)."""
+        return await self._store.count(entry_filter)
 
     async def stats(self) -> dict:
         """

@@ -23,12 +23,14 @@ import asyncio
 import logging
 import time
 import uuid
+from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Response
 
 from semcache.api.dependencies import get_classifier, get_engine, get_provider
 from semcache.cache.classifier import ClassifierResult, IntentClassifier
 from semcache.cache.engine import CacheEngine
+from semcache.cache.keys import parse_cache_tags
 from semcache.cache.policy import CachePolicy
 from semcache.metrics import REQUEST_DURATION, metrics
 from semcache.providers.base import LLMProvider
@@ -104,14 +106,23 @@ async def chat_completions(
     engine: CacheEngine = Depends(get_engine),  # noqa: B008
     provider: LLMProvider = Depends(get_provider),  # noqa: B008
     classifier: IntentClassifier = Depends(get_classifier),  # noqa: B008
+    x_cache_tags: Annotated[str | None, Header()] = None,
 ) -> ChatCompletionResponse:
     """
     OpenAI-compatible chat completions endpoint with semantic caching.
+
+    Optional X-Cache-Tags header ("support, billing:v2") labels the entry
+    this request creates, so it can be invalidated as a group later.
     """
     start_time = time.time()
     cache_status = "error" # Default fallback label
 
     try:
+        try:
+            tags = parse_cache_tags(x_cache_tags)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
         # Streaming is complex (requires Server-Sent Events).
         # We will tackle that in a future phase if needed, or return a 400 for now.
         if request.stream:
@@ -257,6 +268,7 @@ async def chat_completions(
                     model=request.model,
                     response_metadata=response_metadata,
                     policy=resolved_policy,
+                    tags=tags,
                 )
             except Exception:
                 # The user already has their answer; losing one cache write is fine.

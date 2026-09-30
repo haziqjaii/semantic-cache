@@ -32,7 +32,7 @@ def reset_metrics():
     """Reset global metrics singleton before every test."""
     metrics.reset()
 
-from semcache.cache.store.base import CacheEntry, VectorStore
+from semcache.cache.store.base import CacheEntry, EntryFilter, VectorStore
 from semcache.embeddings.base import Embedder
 
 # ── Mock Embedder ───────────────────────────────────────────
@@ -128,18 +128,17 @@ class InMemoryVectorStore(VectorStore):
         self._entries.append((embedding, entry))
         return entry_id
 
-    async def delete_by_namespace(self, namespace: str) -> int:
+    async def delete_matching(self, entry_filter: EntryFilter) -> int:
         before = len(self._entries)
         self._entries = [
             (emb, entry) for emb, entry in self._entries
-            if entry.namespace != namespace
+            if not entry_filter.matches(entry)
         ]
         return before - len(self._entries)
 
-    async def count(self, namespace: str | None = None) -> int:
-        if namespace is None:
-            return len(self._entries)
-        return sum(1 for _, entry in self._entries if entry.namespace == namespace)
+    async def count(self, entry_filter: EntryFilter | None = None) -> int:
+        entry_filter = entry_filter or EntryFilter()
+        return sum(1 for _, entry in self._entries if entry_filter.matches(entry))
 
 
 # ── pytest Fixtures ─────────────────────────────────────────
