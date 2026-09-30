@@ -21,6 +21,8 @@ class ChatCompletionRequest(BaseModel):
     temperature: float | None = 0.7
     max_tokens: int | None = None
     stream: bool | None = False
+    # OpenAI's streaming options; we honour {"include_usage": true}.
+    stream_options: dict[str, Any] | None = None
     # If tools/functions are provided, we will skip caching.
     tools: list[Any] | None = None
 
