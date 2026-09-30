@@ -6,7 +6,7 @@ A semantic caching proxy for LLM APIs, designed to cut latency and API costs.
 
 Start the server (see [Development](#development)) and open **http://localhost:8000**. The playground lets you try the cache by hand:
 
-* **Ask** questions and see each response's `HIT` / `MISS` / `BYPASS` status, similarity, latency and tokens. The example buttons include a reworded question, to show a semantic hit, and a poem, which is never cached.
+* **Ask** questions and see each response's `HIT` / `MISS` / `BYPASS` status, similarity, latency and tokens. With **Stream** ticked, the answer appears as it's generated, and the time to the first word is shown. The example buttons include a reworded question, to show a semantic hit, and a poem, which is never cached.
 * **Totals** since the server started: hit rate, tokens spent and saved, and money saved (RM).
 * **Feedback:** on a `HIT`, say whether the cached answer was right.
 * **Near misses:** questions that almost matched a cached one. Mark each as *Same question* or *Different*.
@@ -16,9 +16,29 @@ Start the server (see [Development](#development)) and open **http://localhost:8
 
 The page only calls the public API, so what it shows is exactly what any client would see.
 
+## Streaming
+
+Send `"stream": true` and the answer arrives as Server-Sent Events in OpenAI's format (`chat.completion.chunk` events, then `data: [DONE]`). Add `"stream_options": {"include_usage": true}` to get token counts in a final event. The cache headers (`X-Cache-Status` and friends) are on the response as usual.
+
+| Outcome | What is streamed | Cached? |
+|---|---|---|
+| **HIT** | The cached answer, sent at once (no LLM call) | Already is |
+| **MISS** | The LLM's answer, passed through as it's generated | Only if it finishes normally (`finish_reason: "stop"`) |
+| **BYPASS** | The LLM's answer, passed through | Never |
+
+A streamed answer is **not** cached if the client disconnects before it ends, if it's cut off (`length`, `content_filter`), or if the LLM fails partway. A partial answer is never served to anyone else. An answer cached from a streamed request is served to later requests whether or not they stream.
+
+## When the LLM fails
+
+LLM failures are reported as such, not as a generic 500:
+
+* Overloaded or rate-limited (`503` / `429` from the provider) keeps that status, so clients know to retry.
+* Any other provider failure is a `502`.
+* While streaming, a failure **before** the first word is a normal HTTP error like the above. **After** that, the `200` status is already sent, so the stream ends with an error event instead of `[DONE]`: `data: {"error": {"message": "...", "type": "upstream_error"}}`.
+
 ## Endpoints
 
-* **`POST /v1/chat/completions`**: OpenAI-compatible endpoint. Drops into existing applications effortlessly. Every response has an `X-Cache-Status` header (`HIT`, `MISS`, or `BYPASS`), plus `X-Cache-Similarity` on hits, `X-Cache-Bypass-Reason` (`uncacheable` or `cache-error`) on bypasses, and `X-Cache-Lookup-Id` (for feedback) on hits and misses. Cache hits replay the original answer's `usage` and `finish_reason`.
+* **`POST /v1/chat/completions`**: OpenAI-compatible endpoint. Drops into existing applications effortlessly. Every response has an `X-Cache-Status` header (`HIT`, `MISS`, or `BYPASS`), plus `X-Cache-Similarity` on hits, `X-Cache-Bypass-Reason` (`uncacheable` or `cache-error`) on bypasses, and `X-Cache-Lookup-Id` (for feedback) on hits and misses. Cache hits replay the original answer's `usage` and `finish_reason`. Supports `"stream": true` (see [Streaming](#streaming)).
 * **`GET /v1/analytics`**: JSON dashboard showing hit rates, tokens spent and saved, money saved (RM), and classifier performance. (Note: metrics reset on process restart).
 * **`GET /metrics`**: Prometheus-formatted metrics (counters, request duration histograms, similarity score histograms, live cache sizes, tokens and money saved).
 * **`GET /v1/cache/stats`**: Live Redis store stats (entry count, plus Redis-wide evicted/expired key counters).

@@ -8,32 +8,48 @@ This is the user-facing API. Every request flows through here:
   4. On MISS → generate from LLM + classify intent CONCURRENTLY
   5. Store response with classifier's policy (TTL + required_similarity)
 
-The classifier runs concurrently with the main LLM via asyncio.gather,
-so it adds ZERO user-facing latency. If the classifier fails for any
-reason, we fall back to the engine's default policy — the user never notices.
+The classifier runs concurrently with the main LLM, so it adds ZERO
+user-facing latency. If the classifier fails for any reason, we fall back
+to the engine's default policy — the user never notices.
 
 The cache is an optimization, never a dependency: if Redis or the embedding
 API fails during lookup or store, the user still gets the LLM's answer.
 
 Every response carries an X-Cache-Status header (HIT, MISS, or BYPASS), so
 clients can see cache behavior without changing how they parse the body.
+
+STREAMING ("stream": true)
+    The same four outcomes, delivered as Server-Sent Events (see streaming.py):
+      - HIT:    the cached answer is sent at once, in streaming format.
+      - MISS:   the LLM's answer is passed through as it's generated, while
+                we keep a copy. It's cached only if it finished normally;
+                if the client disconnects or the answer is cut off, nothing
+                is cached.
+      - BYPASS: passed through, never cached.
+    An LLM failure before the first word is a normal HTTP error (502/503).
+    After that the status is already sent, so the stream ends with an
+    error event instead.
 """
 
 import asyncio
 import logging
 import time
 import uuid
+from collections.abc import AsyncIterator, Callable
+from contextlib import suppress
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Response
+from fastapi.responses import StreamingResponse
 
 from semcache.api.dependencies import get_classifier, get_engine, get_provider
+from semcache.api.streaming import DONE, SSE_HEADERS, SSE_MEDIA_TYPE, ChunkWriter
 from semcache.cache.classifier import ClassifierResult, IntentClassifier
-from semcache.cache.engine import CacheEngine
+from semcache.cache.engine import CacheEngine, LookupResult
 from semcache.cache.keys import parse_cache_tags
 from semcache.cache.policy import CachePolicy
 from semcache.metrics import REQUEST_DURATION, metrics
-from semcache.providers.base import LLMProvider
+from semcache.providers.base import LLMProvider, StreamChunk
 from semcache.schemas import (
     ChatCompletionChoice,
     ChatCompletionChoiceMessage,
@@ -47,31 +63,39 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-def _set_cache_headers(
-    http_response: Response,
+# ── Headers ─────────────────────────────────────────────────
+
+def _cache_headers(
     status: str,
     *,
     similarity: float | None = None,
     bypass_reason: str | None = None,
     lookup_id: str | None = None,
-) -> None:
-    """Report cache behavior in headers, as a drop-in proxy should."""
-    http_response.headers["X-Cache-Status"] = status
+) -> dict[str, str]:
+    """Cache behavior as response headers, as a drop-in proxy should report it."""
+    headers = {"X-Cache-Status": status}
     if similarity is not None:
-        http_response.headers["X-Cache-Similarity"] = f"{similarity:.4f}"
+        headers["X-Cache-Similarity"] = f"{similarity:.4f}"
     if bypass_reason is not None:
-        http_response.headers["X-Cache-Bypass-Reason"] = bypass_reason
+        headers["X-Cache-Bypass-Reason"] = bypass_reason
     if lookup_id is not None:
         # Clients send this back to POST /v1/cache/feedback.
-        http_response.headers["X-Cache-Lookup-Id"] = lookup_id
+        headers["X-Cache-Lookup-Id"] = lookup_id
+    return headers
 
 
-def _record_llm_usage(response: ChatCompletionResponse) -> None:
+def _set_cache_headers(http_response: Response, status: str, **details) -> None:
+    http_response.headers.update(_cache_headers(status, **details))
+
+
+# ── Metrics ─────────────────────────────────────────────────
+
+def _record_llm_usage(usage: UsageInfo | None) -> None:
     """Count an LLM call and its tokens, on every path that calls the provider."""
     metrics.llm_calls += 1
-    if response.usage:
-        metrics.llm_tokens_prompt += response.usage.prompt_tokens
-        metrics.llm_tokens_completion += response.usage.completion_tokens
+    if usage:
+        metrics.llm_tokens_prompt += usage.prompt_tokens
+        metrics.llm_tokens_completion += usage.completion_tokens
 
 
 def _record_cache_saving(model: str, usage: UsageInfo | None) -> None:
@@ -86,16 +110,220 @@ def _record_cache_saving(model: str, usage: UsageInfo | None) -> None:
         metrics.cost_saved_myr += saved
 
 
+# ── LLM errors ──────────────────────────────────────────────
+
+def _provider_http_error(exc: BaseException) -> HTTPException:
+    """
+    Turn a failed LLM call into an HTTP error the client can act on.
+
+    Overload and rate-limit errors keep their status (503 / 429), so
+    clients know to retry; anything else is a 502 (bad gateway). Without
+    this, every provider failure would surface as a generic 500.
+    """
+    if isinstance(exc, HTTPException):
+        return exc
+    logger.error("LLM provider call failed", exc_info=exc)
+    upstream_status = getattr(exc, "code", None)  # google-genai API errors carry the HTTP code
+    status = upstream_status if upstream_status in (429, 503) else 502
+    return HTTPException(status_code=status, detail=f"LLM provider error: {exc}")
+
+
+# ── Shared steps of a cache miss ────────────────────────────
+
+def _resolve_policy(
+    classify_result: object, engine: CacheEngine
+) -> tuple[CachePolicy, str | None]:
+    """
+    The cache policy and intent for a new entry, from the classifier's result.
+
+    If the classifier failed (despite classify_safe's try/except), or
+    returned an unexpected type, fall back to the engine's default.
+    """
+    if isinstance(classify_result, ClassifierResult):
+        metrics.classifier_tokens_total += classify_result.tokens
+        if classify_result.is_fallback:
+            metrics.classifier_calls_fallback += 1
+        else:
+            metrics.classifier_calls_success += 1
+        return classify_result.policy, classify_result.intent
+
+    if isinstance(classify_result, BaseException):
+        logger.warning("Classifier raised: %s", classify_result)
+    else:
+        logger.warning("Classifier returned unexpected type: %s", type(classify_result))
+    metrics.classifier_calls_fallback += 1
+    return engine.default_policy, None
+
+
+async def _store_answer(
+    engine: CacheEngine,
+    lookup_result: LookupResult,
+    *,
+    prompt: str,
+    model: str,
+    text: str,
+    finish_reason: str,
+    usage: UsageInfo | None,
+    policy: CachePolicy,
+    intent: str | None,
+    tags: list[str],
+) -> None:
+    """Cache a freshly generated answer, if it's fit to be served again."""
+    if finish_reason != "stop" or not text.strip():
+        # Truncated, filtered, or empty generations must not be served to
+        # future users. Only answers that finished normally are cached.
+        logger.warning(
+            "Not caching response (finish_reason=%s, empty=%s) for prompt: %s",
+            finish_reason,
+            not text.strip(),
+            prompt[:50],
+        )
+        return
+    if lookup_result.embedding is None:
+        return
+
+    # Keep what a hit needs to replay the answer faithfully and to
+    # credit the exact cost it saves.
+    response_metadata: dict = {"finish_reason": finish_reason}
+    if usage:
+        response_metadata["usage"] = usage.model_dump()
+    try:
+        await engine.store(
+            lookup_result=lookup_result,
+            prompt=prompt,
+            response=text,
+            model=model,
+            response_metadata=response_metadata,
+            policy=policy,
+            tags=tags,
+            intent=intent,
+        )
+    except Exception:
+        # The user already has their answer; losing one cache write is fine.
+        logger.exception("Cache store failed, returning uncached response")
+        metrics.cache_store_errors += 1
+
+
 async def _generate_uncached(
     request: ChatCompletionRequest, provider: LLMProvider
 ) -> ChatCompletionResponse:
     """Generate straight from the LLM, with no cache read or write."""
     # Nothing will be stored, so a classifier call would be wasted.
     metrics.classifier_calls_skipped += 1
-    response = await provider.generate(request)
-    _record_llm_usage(response)
+    try:
+        response = await provider.generate(request)
+    except Exception as exc:
+        raise _provider_http_error(exc) from exc
+    _record_llm_usage(response.usage)
     return response
 
+
+# ── Streaming ───────────────────────────────────────────────
+
+async def _stream_cached(
+    writer: ChunkWriter,
+    text: str,
+    finish_reason: str,
+    usage: UsageInfo | None,
+    include_usage: bool,
+    on_done: Callable[[], None],
+) -> AsyncIterator[str]:
+    """A cache hit in streaming format: the whole answer at once."""
+    yield writer.role()
+    yield writer.content(text)
+    yield writer.finish(finish_reason)
+    if include_usage and usage:
+        yield writer.usage(usage)
+    yield DONE
+    on_done()
+
+
+async def _stream_generation(
+    writer: ChunkWriter,
+    first: StreamChunk | None,
+    chunks: AsyncIterator[StreamChunk],
+    include_usage: bool,
+    on_done: Callable[[], None],
+    classify_task: asyncio.Task | None = None,
+    on_complete: Callable[[str, str, UsageInfo | None], object] | None = None,
+) -> AsyncIterator[str]:
+    """
+    Pass the LLM's answer to the client as it arrives, keeping a copy.
+
+    `first` is the chunk already read from `chunks` (the caller reads it
+    before responding, so early failures can be proper HTTP errors).
+
+    When the answer is complete, `on_complete(text, finish_reason, usage)`
+    runs (it stores the answer in the cache) before the closing events are
+    sent. If the client disconnects, or the stream breaks or is cut short,
+    it never runs, so partial answers are never cached.
+    """
+    parts: list[str] = []
+    finish_reason: str | None = None
+    usage: UsageInfo | None = None
+    completed = False
+    try:
+        yield writer.role()
+        chunk = first
+        while chunk is not None:
+            if chunk.text:
+                parts.append(chunk.text)
+                yield writer.content(chunk.text)
+            usage = chunk.usage or usage
+            finish_reason = chunk.finish_reason or finish_reason
+            chunk = await anext(chunks, None)
+
+        if finish_reason is None:
+            raise RuntimeError("The model's response ended unexpectedly.")
+
+        completed = True
+        if on_complete is not None:
+            await on_complete("".join(parts), finish_reason, usage)
+
+        yield writer.finish(finish_reason)
+        if include_usage and usage:
+            yield writer.usage(usage)
+        yield DONE
+        on_done()
+    except Exception as exc:  # noqa: BLE001 - logged by _provider_http_error
+        # The 200 status is already sent, so report the failure in-band.
+        yield writer.error(_provider_http_error(exc).detail)
+    finally:
+        # Runs on normal completion, on errors, and when the client
+        # disconnects (the generator is cancelled mid-stream).
+        _record_llm_usage(usage)
+        if classify_task is not None and not completed:
+            classify_task.cancel()
+        close = getattr(chunks, "aclose", None)
+        if close is not None:
+            with suppress(Exception):
+                await close()  # stop reading from the provider
+
+
+async def _start_stream(
+    provider: LLMProvider, request: ChatCompletionRequest
+) -> tuple[AsyncIterator[StreamChunk], StreamChunk | None]:
+    """
+    Open the provider stream and read its first chunk.
+
+    Reading one chunk before responding means a provider that fails
+    straight away (overloaded, bad model name) still produces a proper
+    HTTP error instead of a broken stream.
+    """
+    chunks = provider.generate_stream(request)
+    try:
+        return chunks, await anext(chunks, None)
+    except Exception as exc:
+        raise _provider_http_error(exc) from exc
+
+
+def _sse_response(events: AsyncIterator[str], cache_headers: dict[str, str]) -> StreamingResponse:
+    return StreamingResponse(
+        events, media_type=SSE_MEDIA_TYPE, headers={**SSE_HEADERS, **cache_headers}
+    )
+
+
+# ── The endpoint ────────────────────────────────────────────
 
 @router.post("/chat/completions", response_model=ChatCompletionResponse)
 async def chat_completions(
@@ -105,15 +333,37 @@ async def chat_completions(
     provider: LLMProvider = Depends(get_provider),  # noqa: B008
     classifier: IntentClassifier = Depends(get_classifier),  # noqa: B008
     x_cache_tags: Annotated[str | None, Header()] = None,
-) -> ChatCompletionResponse:
+) -> ChatCompletionResponse | StreamingResponse:
     """
     OpenAI-compatible chat completions endpoint with semantic caching.
 
     Optional X-Cache-Tags header ("support, billing:v2") labels the entry
     this request creates, so it can be invalidated as a group later.
+
+    With "stream": true the answer is sent as Server-Sent Events; add
+    "stream_options": {"include_usage": true} to get token counts too.
     """
     start_time = time.time()
-    cache_status = "error" # Default fallback label
+    # The latency label. "error" (never observed) until an outcome is known;
+    # streamed responses observe theirs when the stream ends instead.
+    cache_status = "error"
+    streaming = bool(request.stream)
+    include_usage = bool((request.stream_options or {}).get("include_usage"))
+
+    def observe(status: str) -> None:
+        REQUEST_DURATION.labels(cache_status=status, model=request.model).observe(
+            time.time() - start_time
+        )
+
+    async def stream_uncached(status: str, bypass_reason: str) -> StreamingResponse:
+        """Stream straight from the LLM, with no cache read or write."""
+        metrics.classifier_calls_skipped += 1
+        chunks, first = await _start_stream(provider, request)
+        events = _stream_generation(
+            ChunkWriter(request.model), first, chunks, include_usage,
+            on_done=lambda: observe(status),
+        )
+        return _sse_response(events, _cache_headers("BYPASS", bypass_reason=bypass_reason))
 
     try:
         try:
@@ -121,17 +371,11 @@ async def chat_completions(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        # Streaming is complex (requires Server-Sent Events).
-        # We will tackle that in a future phase if needed, or return a 400 for now.
-        if request.stream:
-            raise HTTPException(
-                status_code=400,
-                detail="Streaming is not currently supported by this proxy.",
-            )
-
         # 1. Option A: Should we cache this at all?
         if not request.is_cacheable:
             metrics.cache_bypasses += 1
+            if streaming:
+                return await stream_uncached("bypass", "uncacheable")
             response = await _generate_uncached(request, provider)
             response.x_cache_status = "BYPASS (Uncacheable)"
             _set_cache_headers(http_response, "BYPASS", bypass_reason="uncacheable")
@@ -160,6 +404,8 @@ async def chat_completions(
             # Embedding API or Redis is down. Serve the request without the cache.
             logger.exception("Cache lookup failed, serving uncached response")
             metrics.cache_lookup_errors += 1
+            if streaming:
+                return await stream_uncached("cache_error", "cache-error")
             response = await _generate_uncached(request, provider)
             response.x_cache_status = "BYPASS (Cache error)"
             _set_cache_headers(http_response, "BYPASS", bypass_reason="cache-error")
@@ -172,14 +418,23 @@ async def chat_completions(
             entry = lookup_result.entry
             metadata = entry.response_metadata or {}
             usage = UsageInfo(**metadata["usage"]) if metadata.get("usage") else None
+            finish_reason = metadata.get("finish_reason", "stop")
+            hit_headers = _cache_headers(
+                "HIT", similarity=lookup_result.similarity, lookup_id=lookup_result.lookup_id
+            )
 
             metrics.cache_hits += 1
             metrics.classifier_calls_skipped += 1  # No classify needed on hit
             _record_cache_saving(entry.model, usage)
-            _set_cache_headers(
-                http_response, "HIT",
-                similarity=lookup_result.similarity, lookup_id=lookup_result.lookup_id,
-            )
+
+            if streaming:
+                events = _stream_cached(
+                    ChunkWriter(request.model, cached=True), entry.response, finish_reason,
+                    usage, include_usage, on_done=lambda: observe("hit"),
+                )
+                return _sse_response(events, hit_headers)
+
+            http_response.headers.update(hit_headers)
             cache_status = "hit"
             return ChatCompletionResponse(
                 id=f"chatcmpl-cached-{uuid.uuid4().hex[:8]}",
@@ -188,7 +443,7 @@ async def chat_completions(
                 choices=[
                     ChatCompletionChoice(
                         message=ChatCompletionChoiceMessage(content=entry.response),
-                        finish_reason=metadata.get("finish_reason", "stop"),
+                        finish_reason=finish_reason,
                     )
                 ],
                 usage=usage,
@@ -197,6 +452,32 @@ async def chat_completions(
 
         # 4. Cache MISS → Generate from LLM + Classify intent CONCURRENTLY
         metrics.cache_misses += 1
+        miss_headers = _cache_headers("MISS", lookup_id=lookup_result.lookup_id)
+
+        if streaming:
+            # The classifier runs while the answer streams; its result is
+            # only needed at the end, when the answer is stored.
+            classify_task = asyncio.create_task(classifier.classify_safe(user_prompt))
+            try:
+                chunks, first = await _start_stream(provider, request)
+            except BaseException:
+                classify_task.cancel()
+                raise
+
+            async def store_streamed(text: str, finish_reason: str, usage: UsageInfo | None) -> None:
+                classify_result = (await asyncio.gather(classify_task, return_exceptions=True))[0]
+                policy, intent = _resolve_policy(classify_result, engine)
+                await _store_answer(
+                    engine, lookup_result, prompt=user_prompt, model=request.model, text=text,
+                    finish_reason=finish_reason, usage=usage, policy=policy, intent=intent, tags=tags,
+                )
+
+            events = _stream_generation(
+                ChunkWriter(request.model), first, chunks, include_usage,
+                on_done=lambda: observe("miss"),
+                classify_task=classify_task, on_complete=store_streamed,
+            )
+            return _sse_response(events, miss_headers)
 
         # Run both tasks at the same time. The main generation takes 1-5s.
         # The classifier takes ~200ms. By running them together, the classifier
@@ -204,82 +485,34 @@ async def chat_completions(
         #
         # return_exceptions=True ensures that if the classifier fails, it returns
         # the exception object instead of raising — so the generation still completes.
-        gen_task = provider.generate(request)
-        classify_task = classifier.classify_safe(user_prompt)
+        gen_result, classify_result = await asyncio.gather(
+            provider.generate(request),
+            classifier.classify_safe(user_prompt),
+            return_exceptions=True,
+        )
 
-        results = await asyncio.gather(gen_task, classify_task, return_exceptions=True)
-
-        # Unpack results — check types for safety
-        gen_result = results[0]
-        classify_result = results[1]
-
-        # If the generation itself failed, that's a real error — re-raise it.
+        # If the generation itself failed, that's a real error.
+        if isinstance(gen_result, Exception):
+            raise _provider_http_error(gen_result) from gen_result
         if isinstance(gen_result, BaseException):
-            raise gen_result
+            raise gen_result  # e.g. the request was cancelled
 
         response: ChatCompletionResponse = gen_result
-        _record_llm_usage(response)
-
-        # If the classifier failed (despite classify_safe's try/except),
-        # or returned an unexpected type, fall back to the engine's default.
-        intent: str | None = None
-        if isinstance(classify_result, BaseException):
-            logger.warning("Classifier raised in gather: %s", classify_result)
-            resolved_policy: CachePolicy = engine.default_policy
-            metrics.classifier_calls_fallback += 1
-        elif isinstance(classify_result, ClassifierResult):
-            resolved_policy = classify_result.policy
-            intent = classify_result.intent
-            metrics.classifier_tokens_total += classify_result.tokens
-            if classify_result.is_fallback:
-                metrics.classifier_calls_fallback += 1
-            else:
-                metrics.classifier_calls_success += 1
-        else:
-            logger.warning("Classifier returned unexpected type: %s", type(classify_result))
-            resolved_policy = engine.default_policy
-            metrics.classifier_calls_fallback += 1
+        _record_llm_usage(response.usage)
+        policy, intent = _resolve_policy(classify_result, engine)
 
         # 5. Store the new response with the classifier's policy
         choice = response.choices[0]
-        generated_text = choice.message.content
+        await _store_answer(
+            engine, lookup_result, prompt=user_prompt, model=request.model,
+            text=choice.message.content, finish_reason=choice.finish_reason,
+            usage=response.usage, policy=policy, intent=intent, tags=tags,
+        )
 
-        if choice.finish_reason != "stop" or not generated_text.strip():
-            # Truncated, filtered, or empty generations must not be served to
-            # future users. Only answers that finished normally are cached.
-            logger.warning(
-                "Not caching response (finish_reason=%s, empty=%s) for prompt: %s",
-                choice.finish_reason,
-                not generated_text.strip(),
-                user_prompt[:50],
-            )
-        elif lookup_result.embedding is not None:
-            # Keep what a hit needs to replay the answer faithfully and to
-            # credit the exact cost it saves.
-            response_metadata: dict = {"finish_reason": choice.finish_reason}
-            if response.usage:
-                response_metadata["usage"] = response.usage.model_dump()
-            try:
-                await engine.store(
-                    lookup_result=lookup_result,
-                    prompt=user_prompt,
-                    response=generated_text,
-                    model=request.model,
-                    response_metadata=response_metadata,
-                    policy=resolved_policy,
-                    tags=tags,
-                    intent=intent,
-                )
-            except Exception:
-                # The user already has their answer; losing one cache write is fine.
-                logger.exception("Cache store failed, returning uncached response")
-                metrics.cache_store_errors += 1
-
-        _set_cache_headers(http_response, "MISS", lookup_id=lookup_result.lookup_id)
+        http_response.headers.update(miss_headers)
         cache_status = "miss"
         return response
 
     finally:
         if cache_status != "error":
-            duration = time.time() - start_time
-            REQUEST_DURATION.labels(cache_status=cache_status, model=request.model).observe(duration)
+            observe(cache_status)

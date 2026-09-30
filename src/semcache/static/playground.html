@@ -132,6 +132,7 @@
       </details>
       <div class="actions">
         <button id="send" class="primary">Send</button>
+        <label class="check" style="margin:0" title="Show the answer as it is generated"><input type="checkbox" id="stream" checked> Stream</label>
         <span class="muted">Try:</span>
         <button class="chip" data-q="What is the capital of Malaysia?">Capital of Malaysia</button>
         <button class="chip" data-q="Which city is Malaysia's capital?">…reworded</button>
@@ -287,6 +288,11 @@ async function send() {
   if (temperature !== "") body.temperature = Number(temperature);
   const headers = { "Content-Type": "application/json" };
   if ($("tags").value.trim()) headers["X-Cache-Tags"] = $("tags").value.trim();
+  const streaming = $("stream").checked;
+  if (streaming) {
+    body.stream = true;
+    body.stream_options = { include_usage: true };
+  }
 
   $("send").disabled = true;
   $("send").textContent = "Sending…";
@@ -298,17 +304,29 @@ async function send() {
     if (!response.ok) {
       record = { question, model, status: "ERROR", latency, error: await errorText(response) };
     } else {
-      const data = await response.json();
       record = {
         question, model, latency,
         status: response.headers.get("X-Cache-Status") || "?",
         similarity: response.headers.get("X-Cache-Similarity"),
         reason: response.headers.get("X-Cache-Bypass-Reason"),
         lookupId: response.headers.get("X-Cache-Lookup-Id"),
-        answer: data.choices?.[0]?.message?.content ?? "",
-        finishReason: data.choices?.[0]?.finish_reason,
-        usage: data.usage,
+        answer: "",
       };
+      if (streaming) {
+        // The headers are already here: show the status, then fill in the
+        // answer as its pieces arrive.
+        showResult(record);
+        const result = await readStream(response, (text) => {
+          record.firstWord ??= performance.now() - started;
+          $("r-answer").textContent = text;
+        });
+        Object.assign(record, result, { latency: performance.now() - started });
+      } else {
+        const data = await response.json();
+        record.answer = data.choices?.[0]?.message?.content ?? "";
+        record.finishReason = data.choices?.[0]?.finish_reason;
+        record.usage = data.usage;
+      }
     }
   } catch (err) {
     record = { question, model, status: "ERROR", latency: performance.now() - started, error: `Network error: ${err.message}` };
@@ -323,16 +341,45 @@ async function send() {
   refreshAll();
 }
 
+// Read an OpenAI-style event stream: "data: {...}" blocks separated by
+// blank lines, ending with "data: [DONE]". Calls onText with the answer so far.
+async function readStream(response, onText) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const result = { answer: "", finishReason: null, usage: null, streamError: null };
+  let buffer = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let end;
+    while ((end = buffer.indexOf("\n\n")) !== -1) {
+      const block = buffer.slice(0, end);
+      buffer = buffer.slice(end + 2);
+      if (!block.startsWith("data: ") || block === "data: [DONE]") continue;
+      const event = JSON.parse(block.slice(6));
+      if (event.error) { result.streamError = event.error.message; continue; }
+      if (event.usage) result.usage = event.usage;
+      const choice = event.choices?.[0];
+      if (choice?.delta?.content) { result.answer += choice.delta.content; onText(result.answer); }
+      if (choice?.finish_reason) result.finishReason = choice.finish_reason;
+    }
+  }
+  return result;
+}
+
 function showResult(r) {
   $("result-empty").hidden = true;
   $("result").hidden = false;
   $("r-status").className = `badge ${r.status}`;
   $("r-status").textContent = r.status;
   const facts = [["Latency", `${Math.round(r.latency)} ms`]];
+  if (r.firstWord != null) facts.push(["First word", `${Math.round(r.firstWord)} ms`]);
   if (r.similarity) facts.push(["Similarity", r.similarity]);
   if (r.reason) facts.push(["Bypass reason", r.reason]);
   if (r.usage) facts.push(["Tokens", `${r.usage.prompt_tokens} in / ${r.usage.completion_tokens} out`]);
   if (r.finishReason && r.finishReason !== "stop") facts.push(["Finish reason", `${r.finishReason} (not cached)`]);
+  if (r.streamError) facts.push(["Stream error", `${r.streamError} (not cached)`]);
   $("r-facts").replaceChildren(...facts.map(([k, v]) => el("span", {}, [k + ": ", el("b", { text: v })])));
   $("r-answer").textContent = r.error ?? r.answer;
   // Feedback is only asked on hits: that's when a cached answer was served.
