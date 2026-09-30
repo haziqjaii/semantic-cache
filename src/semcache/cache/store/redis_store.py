@@ -98,6 +98,9 @@ def _build_schema(dims: int) -> dict:
             {"name": "ttl_seconds", "type": "numeric"},
             {"name": "hit_count", "type": "numeric"},
             {"name": "required_similarity", "type": "numeric"},
+            # Creation time as a Unix timestamp, sortable so list_entries()
+            # can return the newest entries first.
+            {"name": "created_ts", "type": "numeric", "attrs": {"sortable": True}},
             # The embedding vector — this is what we search against.
             # HNSW = the index algorithm. COSINE = the distance metric.
             {
@@ -118,6 +121,38 @@ def _build_schema(dims: int) -> dict:
             },
         ],
     }
+
+
+# The hash fields read back into a CacheEntry (everything but the vector).
+_ENTRY_FIELDS = [
+    "prompt", "response", "model", "namespace",
+    "created_at", "ttl_seconds", "hit_count",
+    "required_similarity", "response_metadata",
+    "system_prompt_hash", "tags",
+]
+
+
+def _entry_from_result(result: dict) -> CacheEntry:
+    """Build a CacheEntry from a query result containing _ENTRY_FIELDS."""
+    return CacheEntry(
+        prompt=result["prompt"],
+        response=result["response"],
+        model=result["model"],
+        namespace=result["namespace"],
+        created_at=datetime.fromisoformat(result["created_at"]),
+        ttl_seconds=int(result["ttl_seconds"]),
+        hit_count=int(result["hit_count"]),
+        required_similarity=float(result.get("required_similarity", 0.95)),
+        response_metadata=(
+            json.loads(result["response_metadata"])
+            if result.get("response_metadata")
+            else None
+        ),
+        # Absent on entries cached before these fields existed.
+        system_prompt_hash=result.get("system_prompt_hash", ""),
+        tags=[t for t in result.get("tags", "").split(",") if t],
+        id=result.get("id", ""),
+    )
 
 
 def _to_redis_filter(entry_filter: EntryFilter) -> FilterExpression | str:
@@ -215,12 +250,7 @@ class RedisVectorStore(VectorStore):
         query = VectorQuery(
             vector=query_bytes,
             vector_field_name="embedding",
-            return_fields=[
-                "prompt", "response", "model", "namespace",
-                "created_at", "ttl_seconds", "hit_count",
-                "required_similarity", "response_metadata",
-                "system_prompt_hash", "tags",
-            ],
+            return_fields=_ENTRY_FIELDS,
             filter_expression=f"@namespace:{{{namespace}}}",
             num_results=top_k,
         )
@@ -235,28 +265,22 @@ class RedisVectorStore(VectorStore):
             if similarity < threshold:
                 continue
 
-            entry = CacheEntry(
-                prompt=result["prompt"],
-                response=result["response"],
-                model=result["model"],
-                namespace=result["namespace"],
-                created_at=datetime.fromisoformat(result["created_at"]),
-                ttl_seconds=int(result["ttl_seconds"]),
-                hit_count=int(result["hit_count"]),
-                required_similarity=float(result.get("required_similarity", 0.95)),
-                response_metadata=(
-                    json.loads(result["response_metadata"])
-                    if result.get("response_metadata")
-                    else None
-                ),
-                # Absent on entries cached before these fields existed.
-                system_prompt_hash=result.get("system_prompt_hash", ""),
-                tags=[t for t in result.get("tags", "").split(",") if t],
-                id=result.get("id", ""),
-            )
-            candidates.append((entry, similarity))
+            candidates.append((_entry_from_result(result), similarity))
 
         return candidates
+
+    async def list_entries(self, limit: int = 50) -> list[CacheEntry]:
+        """The most recently cached entries, newest first."""
+        if self._index is None:
+            raise RuntimeError("Store not initialized. Call initialize() first.")
+
+        query = FilterQuery(
+            filter_expression="*",
+            return_fields=_ENTRY_FIELDS,
+            num_results=limit,
+            sort_by=("created_ts", "DESC"),
+        )
+        return [_entry_from_result(result) for result in await self._index.query(query)]
 
     async def record_hit(self, entry_id: str) -> None:
         if self._redis and entry_id:
@@ -292,6 +316,7 @@ class RedisVectorStore(VectorStore):
             "model": entry.model,
             "embedding": embedding_bytes,
             "created_at": entry.created_at.isoformat(),
+            "created_ts": entry.created_at.timestamp(),
             "ttl_seconds": entry.ttl_seconds,
             "hit_count": entry.hit_count,
             "required_similarity": entry.required_similarity,
