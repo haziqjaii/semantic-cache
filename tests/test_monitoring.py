@@ -39,11 +39,9 @@ def test_analytics_math(client):
     metrics.embedding_calls = 15
     metrics.embedding_tokens_total = 3000
 
-    # Costs are recorded in MYR as calls happen; analytics reports them.
-    metrics.llm_cost_myr = 2.20
+    # What hits saved, recorded as they happen.
+    metrics.tokens_saved = 120000
     metrics.cost_saved_myr = 2.50
-    metrics.classifier_cost_myr = 0.01
-    metrics.embedding_cost_myr = 0.04
 
     response = client.get("/v1/analytics")
 
@@ -55,19 +53,17 @@ def test_analytics_math(client):
     assert data["cache"]["hit_rate"] == 0.5  # 10 / 20
     assert data["cache"]["hit_rate_cacheable"] == 10 / 15  # hits / (hits + misses)
 
-    # Check cost figures (all MYR)
+    # Tokens: spent = LLM prompt + completion; saved = avoided by hits
+    assert data["tokens"]["spent"] == 135000
+    assert data["tokens"]["saved"] == 120000
+    assert data["tokens"]["classifier"] == 1000
+    assert data["tokens"]["embedding_estimated"] == 3000
+
+    # Money: only the savings, in MYR
     assert data["meta"]["currency"] == "MYR"
     assert data["meta"]["usd_to_myr"] == PRICING_TABLE["usd_to_myr"]
-    assert data["cost"]["estimated_llm_cost_myr"] == pytest.approx(2.20)
-    assert data["cost"]["estimated_cost_saved_myr"] == pytest.approx(2.50)
-    assert data["cost"]["estimated_classifier_cost_myr"] == pytest.approx(0.01)
-    assert data["cost"]["estimated_embedding_cost_myr"] == pytest.approx(0.04)
-    # Net = saved - (classifier + embedding overhead)
-    assert data["cost"]["net_cost_saved_myr"] == pytest.approx(2.50 - 0.01 - 0.04)
-    assert data["cost"]["unpriced_llm_calls"] == 0
-    assert data["cost"]["unpriced_cache_hits"] == 0
-    assert data["cost"]["unpriced_models"] == []
-    assert not any(key.endswith("_usd") for key in data["cost"])
+    assert data["savings"] == {"saved_myr": 2.50, "unpriced_hits": 0, "unpriced_models": []}
+    assert "cost" not in data
 
     # Check classifier stats
     assert data["classifier"]["total_calls"] == 5
@@ -75,17 +71,15 @@ def test_analytics_math(client):
     assert data["classifier"]["fallback_rate"] == 1 / 5
 
 
-def test_analytics_reports_what_could_not_be_priced(client):
-    """Unpriced models and hits are reported, not priced as something else."""
-    metrics.llm_calls_unpriced = 2
+def test_analytics_reports_hits_that_could_not_be_priced(client):
+    """Unpriced hits are reported, not priced as some other model."""
     metrics.cache_hits_unpriced = 3
-    metrics.unpriced_models = {"gemini-9-ultra", "some-future-classifier"}
+    metrics.unpriced_models = {"gemini-9-ultra"}
 
     data = client.get("/v1/analytics").json()
 
-    assert data["cost"]["unpriced_llm_calls"] == 2
-    assert data["cost"]["unpriced_cache_hits"] == 3
-    assert data["cost"]["unpriced_models"] == ["gemini-9-ultra", "some-future-classifier"]
+    assert data["savings"]["unpriced_hits"] == 3
+    assert data["savings"]["unpriced_models"] == ["gemini-9-ultra"]
 
 
 def test_prometheus_metrics_endpoint(client):
@@ -100,18 +94,16 @@ def test_prometheus_metrics_endpoint(client):
     assert "semcache_cache_hits_total 42.0" in response.text
 
 
-def test_prometheus_exports_costs_in_ringgit(client):
+def test_prometheus_exports_savings(client):
     metrics.cost_saved_myr = 12.5
-    metrics.llm_cost_myr = 30.25
-    metrics.classifier_cost_myr = 0.5
-    metrics.embedding_cost_myr = 0.25
+    metrics.tokens_saved = 4000
 
     text = client.get("/metrics").text
 
     assert "semcache_cost_saved_myr_total 12.5" in text
-    assert "semcache_llm_cost_myr_total 30.25" in text
-    assert 'semcache_overhead_cost_myr_total{component="classifier"} 0.5' in text
-    assert 'semcache_overhead_cost_myr_total{component="embedding"} 0.25' in text
+    assert "semcache_tokens_saved_total 4000.0" in text
+    assert "semcache_llm_cost_myr_total" not in text
+    assert "semcache_overhead_cost_myr_total" not in text
 
 
 def test_prometheus_has_per_model_request_counts(client):

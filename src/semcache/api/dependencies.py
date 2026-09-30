@@ -11,6 +11,7 @@ from fastapi import FastAPI
 
 from semcache.cache.classifier import IntentClassifier
 from semcache.cache.engine import CacheEngine
+from semcache.cache.lookup_log import RedisLookupLog
 from semcache.cache.policy import CachePolicy, TTLTier
 from semcache.cache.store.redis_store import RedisVectorStore
 from semcache.config import get_settings
@@ -39,7 +40,10 @@ async def refresh_cache_gauges(engine: CacheEngine) -> None:
 
 async def gauge_refresh_loop(engine: CacheEngine) -> None:
     """
-    Refresh the gauges forever (until cancelled on shutdown).
+    Refresh the gauges and learned thresholds forever (until cancelled on shutdown).
+
+    Re-learning here keeps every server process in step, even though
+    feedback arrives at only one of them.
 
     Failures are logged once when they start and once when they recover,
     so a long Redis outage doesn't flood the log every 15 seconds.
@@ -48,6 +52,7 @@ async def gauge_refresh_loop(engine: CacheEngine) -> None:
     while True:
         try:
             await refresh_cache_gauges(engine)
+            await engine.refresh_learned_thresholds()
         except Exception:
             if not failing:
                 logger.exception(
@@ -103,11 +108,23 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         ttl_tier=tier,
     )
 
+    # Records every lookup for the near-miss analyzer, threshold tuner,
+    # and thresholds learned from feedback.
+    lookup_log = RedisLookupLog(redis_url=settings.redis_url)
+    await lookup_log.initialize()
+
     _engine = CacheEngine(
         embedder=embedder,
         store=store,
         default_policy=default_policy,
+        lookup_log=lookup_log,
     )
+    learned = await _engine.refresh_learned_thresholds()
+    if learned:
+        logger.info(
+            "Using thresholds learned from feedback: %s",
+            {intent: lt.threshold for intent, lt in learned.items()},
+        )
 
     # 4. Initialize LLM Provider
     _provider = GeminiProvider(api_key=settings.gemini_api_key)
@@ -131,6 +148,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await task
     except asyncio.CancelledError:
         pass
+    await lookup_log.close()
     await store.close()
 
 

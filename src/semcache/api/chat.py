@@ -53,6 +53,7 @@ def _set_cache_headers(
     *,
     similarity: float | None = None,
     bypass_reason: str | None = None,
+    lookup_id: str | None = None,
 ) -> None:
     """Report cache behavior in headers, as a drop-in proxy should."""
     http_response.headers["X-Cache-Status"] = status
@@ -60,26 +61,23 @@ def _set_cache_headers(
         http_response.headers["X-Cache-Similarity"] = f"{similarity:.4f}"
     if bypass_reason is not None:
         http_response.headers["X-Cache-Bypass-Reason"] = bypass_reason
+    if lookup_id is not None:
+        # Clients send this back to POST /v1/cache/feedback.
+        http_response.headers["X-Cache-Lookup-Id"] = lookup_id
 
 
 def _record_llm_usage(response: ChatCompletionResponse) -> None:
-    """Count an LLM call, its tokens, and its cost, on every path that calls the provider."""
-    prompt_tokens = response.usage.prompt_tokens if response.usage else 0
-    completion_tokens = response.usage.completion_tokens if response.usage else 0
-
+    """Count an LLM call and its tokens, on every path that calls the provider."""
     metrics.llm_calls += 1
-    metrics.llm_tokens_prompt += prompt_tokens
-    metrics.llm_tokens_completion += completion_tokens
-
-    cost = metrics.price(response.model, prompt_tokens, completion_tokens)
-    if cost is None:
-        metrics.llm_calls_unpriced += 1
-    else:
-        metrics.llm_cost_myr += cost
+    if response.usage:
+        metrics.llm_tokens_prompt += response.usage.prompt_tokens
+        metrics.llm_tokens_completion += response.usage.completion_tokens
 
 
 def _record_cache_saving(model: str, usage: UsageInfo | None) -> None:
-    """Credit a cache hit with the cost of the LLM call it replaced."""
+    """Credit a cache hit with the tokens and cost of the LLM call it replaced."""
+    if usage:
+        metrics.tokens_saved += usage.prompt_tokens + usage.completion_tokens
     saved = metrics.price(model, usage.prompt_tokens, usage.completion_tokens) if usage else None
     if saved is None:
         # Entry cached without token counts, or its model has no pricing.
@@ -178,7 +176,10 @@ async def chat_completions(
             metrics.cache_hits += 1
             metrics.classifier_calls_skipped += 1  # No classify needed on hit
             _record_cache_saving(entry.model, usage)
-            _set_cache_headers(http_response, "HIT", similarity=lookup_result.similarity)
+            _set_cache_headers(
+                http_response, "HIT",
+                similarity=lookup_result.similarity, lookup_id=lookup_result.lookup_id,
+            )
             cache_status = "hit"
             return ChatCompletionResponse(
                 id=f"chatcmpl-cached-{uuid.uuid4().hex[:8]}",
@@ -221,17 +222,15 @@ async def chat_completions(
 
         # If the classifier failed (despite classify_safe's try/except),
         # or returned an unexpected type, fall back to the engine's default.
+        intent: str | None = None
         if isinstance(classify_result, BaseException):
             logger.warning("Classifier raised in gather: %s", classify_result)
             resolved_policy: CachePolicy = engine.default_policy
             metrics.classifier_calls_fallback += 1
         elif isinstance(classify_result, ClassifierResult):
             resolved_policy = classify_result.policy
+            intent = classify_result.intent
             metrics.classifier_tokens_total += classify_result.tokens
-            if classify_result.model:
-                classifier_cost = metrics.price(classify_result.model, classify_result.tokens)
-                if classifier_cost is not None:
-                    metrics.classifier_cost_myr += classifier_cost
             if classify_result.is_fallback:
                 metrics.classifier_calls_fallback += 1
             else:
@@ -269,13 +268,14 @@ async def chat_completions(
                     response_metadata=response_metadata,
                     policy=resolved_policy,
                     tags=tags,
+                    intent=intent,
                 )
             except Exception:
                 # The user already has their answer; losing one cache write is fine.
                 logger.exception("Cache store failed, returning uncached response")
                 metrics.cache_store_errors += 1
 
-        _set_cache_headers(http_response, "MISS")
+        _set_cache_headers(http_response, "MISS", lookup_id=lookup_result.lookup_id)
         cache_status = "miss"
         return response
 

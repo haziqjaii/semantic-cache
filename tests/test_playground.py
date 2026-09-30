@@ -26,11 +26,12 @@ def test_playground_is_served_as_html():
 def test_playground_calls_endpoints_that_exist():
     """Every API path the page fetches must be a real route."""
     page = TestClient(app).get("/playground").text
-    fetched = set(re.findall(r'fetch\("(/[^"?]+)', page))
+    fetched = set(re.findall(r'fetch\(["`](/[^"`?$]+)', page))
     routes = set(app.openapi()["paths"])
 
     assert fetched == {"/v1/chat/completions", "/v1/analytics", "/v1/cache/stats",
-                       "/v1/cache/invalidate", "/v1/cache/entries"}
+                       "/v1/cache/invalidate", "/v1/cache/entries", "/v1/cache/feedback",
+                       "/v1/cache/near-misses", "/v1/cache/tuner", "/v1/cache/thresholds"}
     assert fetched <= routes
 
 

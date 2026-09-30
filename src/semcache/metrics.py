@@ -51,17 +51,14 @@ class CacheMetrics:
     embedding_calls: int = 0
     embedding_tokens_total: int = 0
 
-    # Estimated costs in MYR (see PRICING_TABLE), each priced by the model
-    # that actually served the call, at the moment it happens.
-    llm_cost_myr: float = 0.0
-    classifier_cost_myr: float = 0.0
-    embedding_cost_myr: float = 0.0
-    # Each hit saves exactly what the cached answer originally cost.
+    # What cache hits saved. Each hit saves exactly the tokens its cached
+    # answer originally used, priced in MYR by that answer's model.
+    tokens_saved: int = 0
     cost_saved_myr: float = 0.0
 
-    # What couldn't be priced: models missing from PRICING_TABLE, and hits
-    # on entries cached without token counts. Reported, never guessed.
-    llm_calls_unpriced: int = 0
+    # Hits that couldn't be priced: their model is missing from
+    # PRICING_TABLE, or the entry was cached without token counts.
+    # Reported, never guessed.
     cache_hits_unpriced: int = 0
     unpriced_models: set[str] = field(default_factory=set)
 
@@ -70,7 +67,7 @@ class CacheMetrics:
         Estimated MYR cost of a call, or None if the model has no pricing.
 
         Unpriced models are remembered (and logged once) so /v1/analytics
-        can say which figures are incomplete.
+        can say the savings figure is incomplete.
         """
         cost = estimate_cost_myr(model, input_tokens, output_tokens)
         if cost is None and model not in self.unpriced_models:
@@ -148,25 +145,17 @@ class CacheMetricsCollector:
         yield CounterMetricFamily("semcache_embedding_calls_total", "Total embedding API calls", value=metrics.embedding_calls)
         yield CounterMetricFamily("semcache_embedding_tokens_total", "Total embedding tokens", value=metrics.embedding_tokens_total)
 
-        # 5. Estimated costs in MYR. Net savings = saved - overhead.
+        # 5. What cache hits saved
+        yield CounterMetricFamily(
+            "semcache_tokens_saved_total",
+            "LLM tokens avoided by cache hits",
+            value=metrics.tokens_saved,
+        )
         yield CounterMetricFamily(
             "semcache_cost_saved_myr_total",
             "Estimated LLM cost avoided by cache hits (MYR)",
             value=metrics.cost_saved_myr,
         )
-        yield CounterMetricFamily(
-            "semcache_llm_cost_myr_total",
-            "Estimated LLM generation spend (MYR)",
-            value=metrics.llm_cost_myr,
-        )
-        o = CounterMetricFamily(
-            "semcache_overhead_cost_myr_total",
-            "Estimated cost of running the cache itself (MYR)",
-            labels=["component"],
-        )
-        o.add_metric(["classifier"], metrics.classifier_cost_myr)
-        o.add_metric(["embedding"], metrics.embedding_cost_myr)
-        yield o
 
         # 6. Gauges (updated via background task)
         g_entries = GaugeMetricFamily("semcache_cache_entries", "Total number of entries in the cache")

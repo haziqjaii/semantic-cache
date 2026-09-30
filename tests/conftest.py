@@ -32,6 +32,7 @@ def reset_metrics():
     """Reset global metrics singleton before every test."""
     metrics.reset()
 
+from semcache.cache.lookup_log import LookupEvent, LookupLog
 from semcache.cache.store.base import CacheEntry, EntryFilter, VectorStore
 from semcache.embeddings.base import Embedder
 
@@ -157,3 +158,35 @@ def mock_embedder() -> MockEmbedder:
 def memory_store() -> InMemoryVectorStore:
     """Provide an in-memory vector store for tests."""
     return InMemoryVectorStore()
+
+
+# ── In-Memory Lookup Log ────────────────────────────────────
+
+class InMemoryLookupLog(LookupLog):
+    """Lookup log for tests: a dict of events, newest last."""
+
+    def __init__(self) -> None:
+        self.events: dict[str, LookupEvent] = {}
+
+    async def record(self, event: LookupEvent) -> None:
+        self.events[event.id] = event
+
+    async def get(self, event_id: str) -> LookupEvent | None:
+        return self.events.get(event_id)
+
+    async def label(self, event_id: str, good_match: bool) -> bool:
+        if event_id not in self.events:
+            return False
+        self.events[event_id].good_match = good_match
+        return True
+
+    async def recent(self) -> list[LookupEvent]:
+        return list(reversed(self.events.values()))
+
+    async def labelled(self) -> list[LookupEvent]:
+        return [e for e in self.events.values() if e.good_match is not None]
+
+
+@pytest.fixture
+def lookup_log() -> InMemoryLookupLog:
+    return InMemoryLookupLog()

@@ -7,7 +7,10 @@ A semantic caching proxy for LLM APIs, designed to cut latency and API costs.
 Start the server (see [Development](#development)) and open **http://localhost:8000**. The playground lets you try the cache by hand:
 
 * **Ask** questions and see each response's `HIT` / `MISS` / `BYPASS` status, similarity, latency and tokens. The example buttons include a reworded question, to show a semantic hit, and a poem, which is never cached.
-* **Totals** since the server started: hit rate, and money saved, spent and net, in MYR.
+* **Totals** since the server started: hit rate, tokens spent and saved, and money saved (RM).
+* **Feedback:** on a `HIT`, say whether the cached answer was right.
+* **Near misses:** questions that almost matched a cached one. Mark each as *Same question* or *Different*.
+* **Threshold tuner:** hit rate vs. wrong-answer rate at each threshold, and the threshold each question type uses now.
 * **Invalidate** entries by model, tag, tag prefix or system prompt, with a preview before deleting.
 * **Cached entries**, newest first, with their tags, hit counts, required similarity and expiry. This list is admin-only, like invalidation: if the server sets `ADMIN_TOKEN`, enter it under *Invalidate* (it's saved in your browser only).
 
@@ -15,12 +18,13 @@ The page only calls the public API, so what it shows is exactly what any client 
 
 ## Endpoints
 
-* **`POST /v1/chat/completions`**: OpenAI-compatible endpoint. Drops into existing applications effortlessly. Every response has an `X-Cache-Status` header (`HIT`, `MISS`, or `BYPASS`), plus `X-Cache-Similarity` on hits and `X-Cache-Bypass-Reason` (`uncacheable` or `cache-error`) on bypasses. Cache hits replay the original answer's `usage` and `finish_reason`.
-* **`GET /v1/analytics`**: JSON dashboard showing cache hit rates, cost savings, and classifier performance. (Note: metrics reset on process restart).
-* **`GET /metrics`**: Prometheus-formatted metrics (counters, request duration histograms, similarity score histograms, live cache sizes, and costs).
+* **`POST /v1/chat/completions`**: OpenAI-compatible endpoint. Drops into existing applications effortlessly. Every response has an `X-Cache-Status` header (`HIT`, `MISS`, or `BYPASS`), plus `X-Cache-Similarity` on hits, `X-Cache-Bypass-Reason` (`uncacheable` or `cache-error`) on bypasses, and `X-Cache-Lookup-Id` (for feedback) on hits and misses. Cache hits replay the original answer's `usage` and `finish_reason`.
+* **`GET /v1/analytics`**: JSON dashboard showing hit rates, tokens spent and saved, money saved (RM), and classifier performance. (Note: metrics reset on process restart).
+* **`GET /metrics`**: Prometheus-formatted metrics (counters, request duration histograms, similarity score histograms, live cache sizes, tokens and money saved).
 * **`GET /v1/cache/stats`**: Live Redis store stats (entry count, plus Redis-wide evicted/expired key counters).
 * **`POST /v1/cache/invalidate`**: Delete cached entries by model, system prompt, or tag (see below).
 * **`GET /v1/cache/entries?limit=50`**: The most recently cached entries, newest first (admin-only, like invalidation).
+* **`POST /v1/cache/feedback`**, **`GET /v1/cache/near-misses`**, **`GET /v1/cache/tuner`**, **`GET /v1/cache/thresholds`**: threshold tuning (see below). Feedback and near misses are admin-only.
 * **`GET /playground`** (and `/`, which redirects there): the web playground.
 
 ## Cache invalidation
@@ -50,14 +54,23 @@ Set `ADMIN_TOKEN` to require `Authorization: Bearer <token>` on this endpoint. I
 
 Entries cached before this feature have no system prompt hash or tags, so they can only be cleared by `model` or `all` (or they expire within 24 hours). When the app starts against an older index, it rebuilds the index definition automatically and keeps every cached entry.
 
-## Costs (in Malaysian ringgit)
+## Tuning thresholds: near misses, feedback, and learning
 
-All cost figures are estimates in **MYR**. Model prices live in `PRICING_TABLE` (`src/semcache/config.py`) in USD per million tokens, as providers publish them, and are converted with its `usd_to_myr` rate. Update the rate and its `usd_to_myr_as_of` date along with the prices.
+How similar must two questions be to share an answer? Too loose and people get wrong answers; too strict and the cache rarely hits. The cache learns the answer from feedback:
 
-* **Savings are exact per hit:** each hit is credited with what its cached answer originally cost (its stored token usage, priced by its model).
-* **Overhead** is what running the cache costs: the intent classifier plus prompt embeddings. Embedding tokens are estimated at ~4 characters per token.
-* **Net savings** = savings − overhead.
-* Models missing from `PRICING_TABLE` are never priced as another model. `/v1/analytics` lists them under `unpriced_models`, with counts of the calls and hits it couldn't price.
+1. **Every cacheable request is logged** (in Redis, the most recent 5,000) with the closest cached question and their similarity: a **hit**, a **near miss** (similar, but below the threshold), or a **miss** (nothing similar). Responses carry the log id in `X-Cache-Lookup-Id`.
+2. **People label lookups** with `POST /v1/cache/feedback {"lookup_id": "...", "good_match": true|false}`: for a hit, *was the cached answer right?*; for a near miss, *would it have been right?* Labelled lookups are kept permanently as training data.
+3. **The near-miss analyzer** (`GET /v1/cache/near-misses`) lists lookups that almost matched, to label and to spot phrasings the cache is missing.
+4. **The threshold tuner** (`GET /v1/cache/tuner?intent=factual`) shows, for each threshold from 0.90 to 1.00, how many recent lookups would have hit and how many of those were labelled wrong.
+5. **Learned thresholds** (`GET /v1/cache/thresholds`): once a question type (factual, how_to, …) has **10 labels**, it uses the **lowest** threshold where at least **95%** of labelled matches were right, with at least 5 labels at or above it. It never goes below the lowest similarity anyone has judged, and stays within 0.90–0.99. Lookups use it immediately, including for entries already in the cache.
+
+## Savings (in Malaysian ringgit)
+
+The one money figure is **what cache hits saved**, in **MYR**. Everything else is counted in tokens: `/v1/analytics` reports `tokens.spent` (LLM tokens actually used) and `tokens.saved` (LLM tokens avoided by hits).
+
+* **Savings are exact per hit:** each hit is credited with the tokens its cached answer originally used, priced by that answer's model.
+* Model prices live in `PRICING_TABLE` (`src/semcache/config.py`) in USD per million tokens, as providers publish them, and are converted with its `usd_to_myr` rate. Update the rate and its `usd_to_myr_as_of` date along with the prices.
+* Hits on models missing from `PRICING_TABLE` are never priced as another model. `/v1/analytics` lists them under `savings.unpriced_models`.
 
 ## Monitoring queries (PromQL)
 
@@ -66,9 +79,8 @@ All cost figures are estimates in **MYR**. Model prices live in `PRICING_TABLE` 
 sum by (model) (rate(semcache_request_duration_seconds_count{cache_status="hit"}[5m]))
   / sum by (model) (rate(semcache_request_duration_seconds_count[5m]))
 
-# Net savings per hour, in MYR
+# Money saved per hour, in MYR
 increase(semcache_cost_saved_myr_total[1h])
-  - sum(increase(semcache_overhead_cost_myr_total[1h]))
 
 # P95 latency, cached vs. uncached
 histogram_quantile(0.95, sum by (le, cache_status) (rate(semcache_request_duration_seconds_bucket[5m])))
