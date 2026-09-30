@@ -198,6 +198,14 @@ class VectorStore(ABC):
         """
 
     @abstractmethod
+    async def list_entries(self, limit: int = 50) -> list[CacheEntry]:
+        """
+        The most recently cached entries, newest first.
+
+        Used by the admin API and the playground to show what's cached.
+        """
+
+    @abstractmethod
     async def count(self, entry_filter: EntryFilter | None = None) -> int:
         """
         Count entries, optionally only those matching a filter.

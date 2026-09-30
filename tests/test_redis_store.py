@@ -186,7 +186,8 @@ async def test_response_metadata_round_trip(store: RedisVectorStore):
 
 
 def _entry(namespace="ns", **fields) -> CacheEntry:
-    return CacheEntry(prompt="p", response="r", model=fields.pop("model", "m"), namespace=namespace, **fields)
+    fields.setdefault("prompt", "p")
+    return CacheEntry(response="r", model=fields.pop("model", "m"), namespace=namespace, **fields)
 
 
 @pytest.mark.asyncio
@@ -289,3 +290,20 @@ async def test_old_index_is_upgraded_and_entries_are_kept(redis_url):
         await client.flushdb()
         await client.aclose()
         await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_list_entries_newest_first(store: RedisVectorStore):
+    from datetime import UTC, datetime, timedelta
+
+    emb = [1.0, 0.0, 0.0, 0.0]
+    base = datetime(2026, 9, 30, 12, 0, tzinfo=UTC)
+    for minutes, prompt in [(0, "oldest"), (10, "newest"), (5, "middle")]:
+        await store.store(emb, _entry(prompt=prompt, created_at=base + timedelta(minutes=minutes), tags=["t"]))
+
+    entries = await store.list_entries(limit=2)
+
+    assert [e.prompt for e in entries] == ["newest", "middle"]
+    assert entries[0].tags == ["t"]
+    assert entries[0].id.startswith("semcache:entry:")

@@ -2,6 +2,17 @@
 
 A semantic caching proxy for LLM APIs, designed to cut latency and API costs.
 
+## Playground
+
+Start the server (see [Development](#development)) and open **http://localhost:8000**. The playground lets you try the cache by hand:
+
+* **Ask** questions and see each response's `HIT` / `MISS` / `BYPASS` status, similarity, latency and tokens. The example buttons include a reworded question, to show a semantic hit, and a poem, which is never cached.
+* **Totals** since the server started: hit rate, and money saved, spent and net, in MYR.
+* **Invalidate** entries by model, tag, tag prefix or system prompt, with a preview before deleting.
+* **Cached entries**, newest first, with their tags, hit counts, required similarity and expiry. This list is admin-only, like invalidation: if the server sets `ADMIN_TOKEN`, enter it under *Invalidate* (it's saved in your browser only).
+
+The page only calls the public API, so what it shows is exactly what any client would see.
+
 ## Endpoints
 
 * **`POST /v1/chat/completions`**: OpenAI-compatible endpoint. Drops into existing applications effortlessly. Every response has an `X-Cache-Status` header (`HIT`, `MISS`, or `BYPASS`), plus `X-Cache-Similarity` on hits and `X-Cache-Bypass-Reason` (`uncacheable` or `cache-error`) on bypasses. Cache hits replay the original answer's `usage` and `finish_reason`.
@@ -9,6 +20,8 @@ A semantic caching proxy for LLM APIs, designed to cut latency and API costs.
 * **`GET /metrics`**: Prometheus-formatted metrics (counters, request duration histograms, similarity score histograms, live cache sizes, and costs).
 * **`GET /v1/cache/stats`**: Live Redis store stats (entry count, plus Redis-wide evicted/expired key counters).
 * **`POST /v1/cache/invalidate`**: Delete cached entries by model, system prompt, or tag (see below).
+* **`GET /v1/cache/entries?limit=50`**: The most recently cached entries, newest first (admin-only, like invalidation).
+* **`GET /playground`** (and `/`, which redirects there): the web playground.
 
 ## Cache invalidation
 

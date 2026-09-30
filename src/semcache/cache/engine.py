@@ -343,6 +343,10 @@ class CacheEngine:
         """Count entries matching a filter (all entries if None)."""
         return await self._store.count(entry_filter)
 
+    async def list_entries(self, limit: int = 50) -> list[CacheEntry]:
+        """The most recently cached entries, newest first."""
+        return await self._store.list_entries(limit)
+
     async def stats(self) -> dict:
         """
         Get cache statistics for monitoring.

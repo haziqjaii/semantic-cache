@@ -136,6 +136,10 @@ class InMemoryVectorStore(VectorStore):
         ]
         return before - len(self._entries)
 
+    async def list_entries(self, limit: int = 50) -> list[CacheEntry]:
+        entries = [entry for _, entry in self._entries]
+        return sorted(entries, key=lambda e: e.created_at, reverse=True)[:limit]
+
     async def count(self, entry_filter: EntryFilter | None = None) -> int:
         entry_filter = entry_filter or EntryFilter()
         return sum(1 for _, entry in self._entries if entry_filter.matches(entry))

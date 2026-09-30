@@ -13,15 +13,17 @@ WHY INVALIDATION?
 """
 
 import secrets
+from datetime import timedelta
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, Field, model_validator
 
 from semcache.api.dependencies import get_engine
 from semcache.cache.engine import CacheEngine
 from semcache.cache.keys import hash_system_prompt, normalize_cache_tag
 from semcache.cache.store.base import EntryFilter
+from semcache.cache.store.redis_store import KEY_PREFIX
 from semcache.config import Settings, get_settings
 
 router = APIRouter()
@@ -111,6 +113,38 @@ async def get_stats(engine: CacheEngine = Depends(get_engine)):  # noqa: B008
     """
     stats = await engine.stats()
     return stats
+
+
+@router.get("/entries", dependencies=[Depends(require_admin)])
+async def list_entries(
+    engine: Annotated[CacheEngine, Depends(get_engine)],
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+) -> dict:
+    """
+    The most recently cached entries, newest first.
+
+    Admin-only: entries hold other users' prompts and answers.
+    """
+    entries = await engine.list_entries(limit)
+    return {
+        "entries": [
+            {
+                "id": entry.id.removeprefix(KEY_PREFIX),
+                "prompt": entry.prompt,
+                "response": entry.response,
+                "model": entry.model,
+                "tags": entry.tags,
+                "system_prompt_hash": entry.system_prompt_hash,
+                "created_at": entry.created_at.isoformat(),
+                "expires_at": (entry.created_at + timedelta(seconds=entry.ttl_seconds)).isoformat(),
+                "ttl_seconds": entry.ttl_seconds,
+                "hit_count": entry.hit_count,
+                "required_similarity": entry.required_similarity,
+                "usage": (entry.response_metadata or {}).get("usage"),
+            }
+            for entry in entries
+        ]
+    }
 
 
 @router.post("/invalidate", dependencies=[Depends(require_admin)])

@@ -1,0 +1,414 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Semantic Cache Playground</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --surface: #ffffff; --surface-2: #f1f3f6; --border: #dde1e7;
+    --text: #1b1f24; --muted: #5f6b7a; --accent: #2f6fde; --accent-text: #ffffff;
+    --hit: #1f8a4c; --hit-bg: #e3f4ea; --miss: #a86400; --miss-bg: #fbf0dc;
+    --bypass: #56606d; --bypass-bg: #e9ecf0; --error: #c0392b; --error-bg: #fbe5e2;
+    --radius: 10px; --mono: ui-monospace, SFMono-Regular, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111418; --surface: #1a1e24; --surface-2: #222830; --border: #2e353f;
+      --text: #e6e9ed; --muted: #97a1ad; --accent: #5b93f0; --accent-text: #0b1220;
+      --hit: #4cc17f; --hit-bg: #173226; --miss: #e0a345; --miss-bg: #3a2c14;
+      --bypass: #a3adb9; --bypass-bg: #2a3038; --error: #f07a6d; --error-bg: #3d1f1c;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  header { padding: 18px 16px 6px; max-width: 1280px; margin: 0 auto;
+           display: flex; flex-wrap: wrap; gap: 8px 20px; align-items: baseline; }
+  header h1 { font-size: 20px; margin: 0; }
+  header p { margin: 0; color: var(--muted); flex: 1 1 320px; }
+  header nav a { color: var(--accent); margin-right: 14px; text-decoration: none; font-size: 14px; }
+  main { max-width: 1280px; margin: 0 auto; padding: 10px 16px 40px;
+         display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 16px; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  .col { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+  section { background: var(--surface); border: 1px solid var(--border);
+            border-radius: var(--radius); padding: 16px; min-width: 0; }
+  h2 { font-size: 15px; margin: 0 0 12px; display: flex; align-items: center; gap: 8px; }
+  h2 .hint { font-weight: 400; color: var(--muted); font-size: 13px; }
+  h2 button { margin-left: auto; }
+  label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px; }
+  input, textarea, select { width: 100%; font: inherit; color: var(--text); background: var(--surface-2);
+    border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; }
+  textarea { resize: vertical; }
+  input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .row { display: grid; grid-template-columns: 2fr 1fr 2fr; gap: 10px; margin-top: 10px; }
+  @media (max-width: 560px) { .row { grid-template-columns: 1fr; } }
+  details { margin-top: 10px; }
+  summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+  details textarea { margin-top: 6px; }
+  button { font: inherit; font-size: 14px; border-radius: 8px; padding: 7px 14px; cursor: pointer;
+           border: 1px solid var(--border); background: var(--surface-2); color: var(--text); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); font-weight: 600; }
+  button.danger { border-color: var(--error); color: var(--error); }
+  button:disabled { opacity: .55; cursor: wait; }
+  .actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 12px; }
+  .chip { font-size: 13px; padding: 4px 10px; border-radius: 999px; }
+  .muted { color: var(--muted); font-size: 13px; }
+  .badge { display: inline-block; font-weight: 700; font-size: 13px; letter-spacing: .04em;
+           padding: 3px 10px; border-radius: 999px; }
+  .HIT { color: var(--hit); background: var(--hit-bg); }
+  .MISS { color: var(--miss); background: var(--miss-bg); }
+  .BYPASS { color: var(--bypass); background: var(--bypass-bg); }
+  .ERROR { color: var(--error); background: var(--error-bg); }
+  .facts { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 10px 0; font-size: 14px; }
+  .facts b { font-variant-numeric: tabular-nums; }
+  .answer { white-space: pre-wrap; background: var(--surface-2); border-radius: 8px; padding: 12px;
+            margin: 0; font: inherit; max-height: 360px; overflow: auto; overflow-wrap: anywhere; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
+  .tile { background: var(--surface-2); border-radius: 8px; padding: 10px 12px; }
+  .tile .v { font-size: 19px; font-weight: 650; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .tile .k { font-size: 12px; color: var(--muted); }
+  .tile.good .v { color: var(--hit); }
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; }
+  td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  tbody tr { cursor: pointer; }
+  tbody tr:hover { background: var(--surface-2); }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  @media (max-width: 560px) { .grid2 { grid-template-columns: 1fr; } }
+  .check { display: flex; align-items: center; gap: 6px; margin-top: 10px; color: var(--text); font-size: 14px; }
+  .check input { width: auto; }
+  .result { margin-top: 10px; font-size: 14px; min-height: 1.5em; overflow-wrap: anywhere; }
+  .result.err { color: var(--error); }
+  .entries { list-style: none; margin: 0; padding: 0; }
+  .entries li { padding: 10px 0; border-bottom: 1px solid var(--border); }
+  .entries li:last-child { border-bottom: 0; }
+  .entries .p { font-weight: 600; overflow-wrap: anywhere; }
+  .entries .meta { font-size: 12px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 2px; }
+  .tag { font-size: 11px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 999px; padding: 0 7px; }
+  .empty { color: var(--muted); font-size: 14px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Semantic Cache Playground</h1>
+  <p>Ask a question, then ask it again in different words: a <b>HIT</b> means the answer came from the cache, not the LLM.</p>
+  <nav><a href="/docs" target="_blank">API docs</a><a href="/v1/analytics" target="_blank">Analytics JSON</a><a href="/metrics" target="_blank">Prometheus</a></nav>
+</header>
+
+<main>
+  <div class="col">
+    <section>
+      <h2>Ask <span class="hint">Ctrl+Enter to send</span></h2>
+      <label for="question">Question</label>
+      <textarea id="question" rows="3" placeholder="What is the capital of Malaysia?"></textarea>
+      <div class="row">
+        <div><label for="model">Model</label>
+          <input id="model" list="models" value="gemini-3.5-flash-lite">
+          <datalist id="models"><option value="gemini-3.5-flash-lite"><option value="gemini-3.5-flash"></datalist></div>
+        <div><label for="temperature">Temperature</label><input id="temperature" type="number" min="0" max="2" step="0.1" value="0.7"></div>
+        <div><label for="tags">Cache tags <span class="muted">(optional)</span></label><input id="tags" placeholder="pricing, shop:v2"></div>
+      </div>
+      <details>
+        <summary>System prompt (optional): different prompts never share cached answers</summary>
+        <textarea id="system" rows="2" placeholder="You are a helpful assistant for a Malaysian online shop."></textarea>
+      </details>
+      <div class="actions">
+        <button id="send" class="primary">Send</button>
+        <span class="muted">Try:</span>
+        <button class="chip" data-q="What is the capital of Malaysia?">Capital of Malaysia</button>
+        <button class="chip" data-q="Which city is Malaysia's capital?">…reworded</button>
+        <button class="chip" data-q="How do I reverse a list in Python?">Python how-to</button>
+        <button class="chip" data-q="Write a short poem about monsoon rain.">Poem (never cached)</button>
+      </div>
+    </section>
+
+    <section id="result-card">
+      <h2>Result</h2>
+      <p class="empty" id="result-empty">Send a question to see whether it was served from the cache.</p>
+      <div id="result" hidden>
+        <span id="r-status" class="badge"></span>
+        <div class="facts" id="r-facts"></div>
+        <pre class="answer" id="r-answer"></pre>
+      </div>
+    </section>
+
+    <section>
+      <h2>History <span class="hint">click a row to ask it again</span></h2>
+      <p class="empty" id="history-empty">No requests yet.</p>
+      <div class="table-wrap" id="history-wrap" hidden>
+        <table>
+          <thead><tr><th>Time</th><th>Question</th><th>Model</th><th>Status</th><th>Similarity</th><th>Latency</th></tr></thead>
+          <tbody id="history"></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
+  <div class="col">
+    <section>
+      <h2>Totals <span class="hint">since the server started</span></h2>
+      <div class="tiles" id="tiles"></div>
+      <p class="muted" id="totals-note"></p>
+    </section>
+
+    <section>
+      <h2>Invalidate</h2>
+      <p class="muted" style="margin-top:0">Filters combine with AND. Preview first to see what would be deleted.</p>
+      <div class="grid2">
+        <div><label for="inv-model">Model</label><input id="inv-model" placeholder="gemini-3.5-flash-lite"></div>
+        <div><label for="inv-tag">Tag</label><input id="inv-tag" placeholder="pricing"></div>
+        <div><label for="inv-prefix">Tag prefix</label><input id="inv-prefix" placeholder="shop:"></div>
+        <div><label for="inv-system">System prompt (exact text)</label><input id="inv-system"></div>
+      </div>
+      <label class="check"><input type="checkbox" id="inv-all"> Clear the whole cache (ignores the filters)</label>
+      <div class="actions">
+        <button id="inv-preview">Preview</button>
+        <button id="inv-delete" class="danger">Delete</button>
+      </div>
+      <div class="result" id="inv-result"></div>
+      <details>
+        <summary>Admin token (only if the server sets ADMIN_TOKEN)</summary>
+        <input id="token" type="password" placeholder="Saved in this browser only" autocomplete="off">
+      </details>
+    </section>
+
+    <section>
+      <h2>Cached entries <span class="hint">newest first</span><button id="entries-refresh">Refresh</button></h2>
+      <p class="empty" id="entries-empty">Loading…</p>
+      <ul class="entries" id="entries"></ul>
+    </section>
+  </div>
+</main>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const requests = [];  // this session's requests, newest first
+
+// Build DOM nodes with textContent only, so cached text can never inject HTML.
+function el(tag, props = {}, children = []) {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(props)) {
+    if (k === "text") node.textContent = v; else if (k === "class") node.className = v; else node.setAttribute(k, v);
+  }
+  for (const child of [].concat(children)) if (child != null) node.append(child);
+  return node;
+}
+
+function formatRM(value) {
+  if (!value) return "RM 0.00";
+  const abs = Math.abs(value);
+  return "RM " + (abs >= 0.01 ? value.toFixed(abs >= 1 ? 2 : 4) : value.toPrecision(3));
+}
+
+function formatDuration(seconds) {
+  if (seconds <= 0) return "expired";
+  const h = Math.floor(seconds / 3600), m = Math.floor((seconds % 3600) / 60);
+  return h ? `${h}h ${m}m` : m ? `${m}m` : `${Math.ceil(seconds)}s`;
+}
+
+function adminHeaders() {
+  const token = $("token").value.trim();
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
+// FastAPI errors come back as {"detail": "..."} or {"detail": [{msg}, ...]}.
+async function errorText(response) {
+  const body = await response.text();
+  try {
+    const detail = JSON.parse(body).detail;
+    if (Array.isArray(detail)) return detail.map((d) => d.msg.replace(/^Value error, /, "")).join("; ");
+    if (detail) return String(detail);
+  } catch { /* not JSON */ }
+  return `${response.status} ${response.statusText}${body ? ": " + body.slice(0, 200) : ""}`;
+}
+
+// ── Ask ─────────────────────────────────────────────────────
+async function send() {
+  const question = $("question").value.trim();
+  if (!question) { $("question").focus(); return; }
+  const model = $("model").value.trim() || "gemini-3.5-flash-lite";
+  const system = $("system").value.trim();
+  const messages = system ? [{ role: "system", content: system }] : [];
+  messages.push({ role: "user", content: question });
+  const body = { model, messages };
+  const temperature = $("temperature").value;
+  if (temperature !== "") body.temperature = Number(temperature);
+  const headers = { "Content-Type": "application/json" };
+  if ($("tags").value.trim()) headers["X-Cache-Tags"] = $("tags").value.trim();
+
+  $("send").disabled = true;
+  $("send").textContent = "Sending…";
+  const started = performance.now();
+  let record;
+  try {
+    const response = await fetch("/v1/chat/completions", { method: "POST", headers, body: JSON.stringify(body) });
+    const latency = performance.now() - started;
+    if (!response.ok) {
+      record = { question, model, status: "ERROR", latency, error: await errorText(response) };
+    } else {
+      const data = await response.json();
+      record = {
+        question, model, latency,
+        status: response.headers.get("X-Cache-Status") || "?",
+        similarity: response.headers.get("X-Cache-Similarity"),
+        reason: response.headers.get("X-Cache-Bypass-Reason"),
+        answer: data.choices?.[0]?.message?.content ?? "",
+        finishReason: data.choices?.[0]?.finish_reason,
+        usage: data.usage,
+      };
+    }
+  } catch (err) {
+    record = { question, model, status: "ERROR", latency: performance.now() - started, error: `Network error: ${err.message}` };
+  } finally {
+    $("send").disabled = false;
+    $("send").textContent = "Send";
+  }
+  record.time = new Date();
+  requests.unshift(record);
+  showResult(record);
+  renderHistory();
+  refreshTotals();
+  refreshEntries();
+}
+
+function showResult(r) {
+  $("result-empty").hidden = true;
+  $("result").hidden = false;
+  $("r-status").className = `badge ${r.status}`;
+  $("r-status").textContent = r.status;
+  const facts = [["Latency", `${Math.round(r.latency)} ms`]];
+  if (r.similarity) facts.push(["Similarity", r.similarity]);
+  if (r.reason) facts.push(["Bypass reason", r.reason]);
+  if (r.usage) facts.push(["Tokens", `${r.usage.prompt_tokens} in / ${r.usage.completion_tokens} out`]);
+  if (r.finishReason && r.finishReason !== "stop") facts.push(["Finish reason", `${r.finishReason} (not cached)`]);
+  $("r-facts").replaceChildren(...facts.map(([k, v]) => el("span", {}, [k + ": ", el("b", { text: v })])));
+  $("r-answer").textContent = r.error ?? r.answer;
+}
+
+function renderHistory() {
+  $("history-empty").hidden = requests.length > 0;
+  $("history-wrap").hidden = requests.length === 0;
+  $("history").replaceChildren(...requests.map((r) => {
+    const row = el("tr", { title: "Click to ask again" }, [
+      el("td", { class: "num", text: r.time.toLocaleTimeString() }),
+      el("td", { text: r.question.length > 70 ? r.question.slice(0, 70) + "…" : r.question }),
+      el("td", { text: r.model }),
+      el("td", {}, el("span", { class: `badge ${r.status}`, text: r.status })),
+      el("td", { class: "num", text: r.similarity ?? "–" }),
+      el("td", { class: "num", text: `${Math.round(r.latency)} ms` }),
+    ]);
+    row.addEventListener("click", () => { $("question").value = r.question; $("model").value = r.model; $("question").focus(); });
+    return row;
+  }));
+}
+
+// ── Totals ──────────────────────────────────────────────────
+async function refreshTotals() {
+  try {
+    const [analytics, stats] = await Promise.all([
+      fetch("/v1/analytics").then((r) => r.json()),
+      fetch("/v1/cache/stats").then((r) => (r.ok ? r.json() : {})),
+    ]);
+    const c = analytics.cache, cost = analytics.cost;
+    const tiles = [
+      ["Hit rate", `${Math.round(c.hit_rate_cacheable * 100)}%`, "good"],
+      ["Requests", c.total_requests],
+      ["Hits / misses", `${c.cache_hits} / ${c.cache_misses}`],
+      ["Bypassed", c.cache_bypasses + c.cache_lookup_errors],
+      ["Near misses", c.cache_near_misses],
+      ["Cached entries", stats.total_entries ?? "–"],
+      ["Saved", formatRM(cost.estimated_cost_saved_myr), "good"],
+      ["LLM spend", formatRM(cost.estimated_llm_cost_myr)],
+      ["Cache overhead", formatRM(cost.estimated_classifier_cost_myr + cost.estimated_embedding_cost_myr)],
+      ["Net saved", formatRM(cost.net_cost_saved_myr), cost.net_cost_saved_myr > 0 ? "good" : ""],
+    ];
+    $("tiles").replaceChildren(...tiles.map(([k, v, cls]) =>
+      el("div", { class: `tile ${cls || ""}` }, [el("div", { class: "v", text: String(v) }), el("div", { class: "k", text: k })])));
+    const unpriced = cost.unpriced_models.length ? ` Not priced: ${cost.unpriced_models.join(", ")}.` : "";
+    $("totals-note").textContent =
+      `Hit rate counts cacheable requests only. Costs are estimates at USD→MYR ${analytics.meta.usd_to_myr} (${analytics.meta.usd_to_myr_as_of}).${unpriced}`;
+  } catch (err) {
+    $("totals-note").textContent = `Couldn't load totals: ${err.message}`;
+  }
+}
+
+// ── Invalidate ──────────────────────────────────────────────
+function invalidationBody(dryRun) {
+  if ($("inv-all").checked) return { all: true, dry_run: dryRun };
+  const body = { dry_run: dryRun };
+  const fields = { model: "inv-model", tag: "inv-tag", tag_prefix: "inv-prefix", system_prompt: "inv-system" };
+  for (const [key, id] of Object.entries(fields)) if ($(id).value.trim()) body[key] = $(id).value.trim();
+  return body;
+}
+
+async function invalidate(dryRun) {
+  const body = invalidationBody(dryRun);
+  const out = $("inv-result");
+  if (!dryRun && !confirm(body.all ? "Delete EVERY cached entry?" : "Delete the matching cached entries?")) return;
+  out.className = "result";
+  out.textContent = "Working…";
+  const response = await fetch("/v1/cache/invalidate", {
+    method: "POST", headers: { "Content-Type": "application/json", ...adminHeaders() }, body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    out.className = "result err";
+    out.textContent = response.status === 401 ? "Admin token required: set it below." : await errorText(response);
+    return;
+  }
+  const data = await response.json();
+  const n = dryRun ? data.matched : data.deleted;
+  out.textContent = `${dryRun ? "Would delete" : "Deleted"} ${n} ${n === 1 ? "entry" : "entries"}.`;
+  refreshTotals();
+  refreshEntries();
+}
+
+// ── Cached entries ──────────────────────────────────────────
+async function refreshEntries() {
+  const response = await fetch("/v1/cache/entries?limit=25", { headers: adminHeaders() });
+  if (!response.ok) {
+    $("entries").replaceChildren();
+    $("entries-empty").hidden = false;
+    $("entries-empty").textContent = response.status === 401
+      ? "Set the admin token (under Invalidate) to see cached entries." : await errorText(response);
+    return;
+  }
+  const { entries } = await response.json();
+  $("entries-empty").hidden = entries.length > 0;
+  $("entries-empty").textContent = "The cache is empty.";
+  const now = Date.now();
+  $("entries").replaceChildren(...entries.map((e) => el("li", {}, [
+    el("div", { class: "p", text: e.prompt }),
+    el("div", { class: "meta" }, [
+      el("span", { text: e.model }),
+      el("span", { text: `${e.hit_count} ${e.hit_count === 1 ? "hit" : "hits"}` }),
+      el("span", { text: `matches at ≥ ${e.required_similarity}` }),
+      el("span", { text: `expires in ${formatDuration((Date.parse(e.expires_at) - now) / 1000)}` }),
+      ...e.tags.map((t) => el("span", { class: "tag", text: t })),
+    ]),
+  ])));
+}
+
+// ── Wire up ─────────────────────────────────────────────────
+$("send").addEventListener("click", send);
+$("question").addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) send(); });
+document.querySelectorAll("[data-q]").forEach((b) => b.addEventListener("click", () => { $("question").value = b.dataset.q; send(); }));
+$("inv-preview").addEventListener("click", () => invalidate(true));
+$("inv-delete").addEventListener("click", () => invalidate(false));
+$("entries-refresh").addEventListener("click", refreshEntries);
+try { $("token").value = localStorage.getItem("semcache-admin-token") || ""; } catch { /* storage unavailable */ }
+$("token").addEventListener("change", () => {
+  try { localStorage.setItem("semcache-admin-token", $("token").value.trim()); } catch { /* storage unavailable */ }
+  refreshEntries();
+});
+
+refreshTotals();
+refreshEntries();
+setInterval(refreshTotals, 5000);
+</script>
+</body>
+</html>

@@ -191,3 +191,38 @@ def test_admin_token_is_enforced_when_configured(client, memory_store):
 def test_stats_endpoint(client):
     _ask(client, "q1")
     assert client.get("/v1/cache/stats").json() == {"total_entries": 1}
+
+
+# ── Listing cached entries ──────────────────────────────────
+
+def test_entries_lists_newest_first_with_details(client):
+    _ask(client, "first question", tags="docs")
+    _ask(client, "second question", model="m2")
+
+    entries = client.get("/v1/cache/entries").json()["entries"]
+
+    assert [e["prompt"] for e in entries] == ["second question", "first question"]
+    first = entries[1]
+    assert first["tags"] == ["docs"]
+    assert first["model"] == "m1"
+    assert first["hit_count"] == 0
+    assert first["required_similarity"] == DEFAULT_POLICY.similarity_threshold
+    assert first["expires_at"] > first["created_at"]
+
+
+def test_entries_respects_limit_and_bounds(client):
+    for i in range(3):
+        _ask(client, f"question {i}")
+
+    assert len(client.get("/v1/cache/entries?limit=2").json()["entries"]) == 2
+    assert client.get("/v1/cache/entries?limit=0").status_code == 422
+    assert client.get("/v1/cache/entries?limit=201").status_code == 422
+
+
+def test_entries_requires_admin_token_when_configured(client):
+    app.dependency_overrides[get_settings] = lambda: _settings(admin_token="s3cret")
+
+    assert client.get("/v1/cache/entries").status_code == 401
+    assert client.get(
+        "/v1/cache/entries", headers={"Authorization": "Bearer s3cret"}
+    ).status_code == 200
