@@ -68,8 +68,73 @@ class CacheEntry:
     # Stored as a JSON-serializable dict so we can return it to the client.
     response_metadata: dict | None = None
 
+    # Invalidation handles (see EntryFilter). The system prompt hash
+    # (keys.hash_system_prompt) selects every entry for one system prompt,
+    # across models and parameters.
+    system_prompt_hash: str = ""
+
+    # Labels supplied by the client (X-Cache-Tags header), lowercased.
+    # They group entries for invalidation; they don't partition the cache.
+    tags: list[str] = field(default_factory=list)
+
     # The unique ID of this entry in the store (e.g., Redis key)
     id: str = ""
+
+
+@dataclass(frozen=True)
+class EntryFilter:
+    """
+    Selects cache entries to invalidate or count.
+
+    Set fields are combined with AND. An empty filter matches every entry,
+    so callers must opt in to that explicitly (see CacheEngine.invalidate).
+    Matching is case-insensitive, as Redis TAG fields are.
+    """
+
+    namespace: str | None = None
+    model: str | None = None
+    system_prompt_hash: str | None = None
+    tag: str | None = None  # entry has this tag
+    tag_prefix: str | None = None  # entry has a tag starting with this
+
+    def __post_init__(self) -> None:
+        # An empty value would silently match everything in Redis
+        # (RedisVL turns `field == ""` into a wildcard), so reject it.
+        for name, value in self.as_dict().items():
+            if not value.strip():
+                raise ValueError(f"EntryFilter.{name} must not be empty")
+
+    def as_dict(self) -> dict[str, str]:
+        """The fields that are set."""
+        return {
+            name: value
+            for name in ("namespace", "model", "system_prompt_hash", "tag", "tag_prefix")
+            if (value := getattr(self, name)) is not None
+        }
+
+    def is_empty(self) -> bool:
+        return not self.as_dict()
+
+    def matches(self, entry: CacheEntry) -> bool:
+        """Reference semantics, used by stores that filter in Python."""
+
+        def same(a: str, b: str) -> bool:
+            return a.lower() == b.lower()
+
+        tags = [t.lower() for t in entry.tags]
+        return (
+            (self.namespace is None or same(entry.namespace, self.namespace))
+            and (self.model is None or same(entry.model, self.model))
+            and (
+                self.system_prompt_hash is None
+                or same(entry.system_prompt_hash, self.system_prompt_hash)
+            )
+            and (self.tag is None or self.tag.lower() in tags)
+            and (
+                self.tag_prefix is None
+                or any(t.startswith(self.tag_prefix.lower()) for t in tags)
+            )
+        )
 
 
 class VectorStore(ABC):
@@ -121,21 +186,21 @@ class VectorStore(ABC):
         """
 
     @abstractmethod
-    async def delete_by_namespace(self, namespace: str) -> int:
+    async def delete_matching(self, entry_filter: EntryFilter) -> int:
         """
-        Delete all entries in a namespace.
+        Delete every entry matching the filter (an empty filter deletes all).
 
-        Used for cache invalidation — e.g., when a system prompt changes,
-        all cached responses for that system prompt are stale.
+        Used for cache invalidation — e.g., when a system prompt changes or
+        a model is upgraded, the affected cached responses are stale.
 
         Returns:
             The number of entries deleted.
         """
 
     @abstractmethod
-    async def count(self, namespace: str | None = None) -> int:
+    async def count(self, entry_filter: EntryFilter | None = None) -> int:
         """
-        Count entries, optionally filtered by namespace.
+        Count entries, optionally only those matching a filter.
 
         Used for monitoring and admin endpoints.
         """

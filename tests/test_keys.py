@@ -9,7 +9,14 @@ These tests verify:
   5. Namespace is always a 16-char hex string (format)
 """
 
-from semcache.cache.keys import build_namespace
+import pytest
+
+from semcache.cache.keys import (
+    build_namespace,
+    hash_system_prompt,
+    normalize_cache_tag,
+    parse_cache_tags,
+)
 
 
 class TestBuildNamespace:
@@ -62,3 +69,36 @@ class TestBuildNamespace:
         ns1 = build_namespace(model="gemini-3.5-flash", max_tokens=100)
         ns2 = build_namespace(model="gemini-3.5-flash", max_tokens=1000)
         assert ns1 != ns2
+
+
+class TestHashSystemPrompt:
+    def test_same_prompt_same_hash(self):
+        assert hash_system_prompt("You are helpful.") == hash_system_prompt("You are helpful.")
+
+    def test_none_and_empty_hash_the_same(self):
+        assert hash_system_prompt(None) == hash_system_prompt("")
+
+    def test_is_independent_of_model_and_params(self):
+        """Unlike the namespace, it only depends on the system prompt."""
+        ns_a = build_namespace(model="a", system_prompt="S", temperature=0.0)
+        ns_b = build_namespace(model="b", system_prompt="S", temperature=1.0)
+        assert ns_a != ns_b
+        assert len(hash_system_prompt("S")) == 16
+
+
+class TestCacheTags:
+    def test_parse_normalizes_dedupes_and_sorts(self):
+        assert parse_cache_tags(" Support , billing:V2,support,, ") == ["billing:v2", "support"]
+
+    def test_parse_empty(self):
+        assert parse_cache_tags(None) == []
+        assert parse_cache_tags("") == []
+
+    @pytest.mark.parametrize("bad", ["has space", "semi;colon", "-leading-dash", "x" * 65, "*"])
+    def test_invalid_tags_are_rejected(self, bad):
+        with pytest.raises(ValueError, match="Invalid cache tag"):
+            normalize_cache_tag(bad)
+
+    def test_too_many_tags(self):
+        with pytest.raises(ValueError, match="At most 10"):
+            parse_cache_tags(",".join(f"t{i}" for i in range(11)))

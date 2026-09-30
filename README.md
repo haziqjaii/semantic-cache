@@ -8,6 +8,34 @@ A semantic caching proxy for LLM APIs, designed to cut latency and API costs.
 * **`GET /v1/analytics`**: JSON dashboard showing cache hit rates, cost savings, and classifier performance. (Note: metrics reset on process restart).
 * **`GET /metrics`**: Prometheus-formatted metrics (counters, request duration histograms, similarity score histograms, live cache sizes, and costs).
 * **`GET /v1/cache/stats`**: Live Redis store stats (entry count, plus Redis-wide evicted/expired key counters).
+* **`POST /v1/cache/invalidate`**: Delete cached entries by model, system prompt, or tag (see below).
+
+## Cache invalidation
+
+Changing a system prompt, model, temperature or `max_tokens` already puts requests in a new cache namespace, so outdated entries can't be *served*. They just wait for their TTL to expire. Invalidation is for when the **answers** go stale while the requests stay the same: a model upgraded behind the same name, facts that changed (prices, policies), or a feature you want to reset. It also frees memory.
+
+Label entries by sending an `X-Cache-Tags` header with chat requests (comma-separated; letters, digits, `_ . : -`; up to 10; case-insensitive). Tags group entries for invalidation; they don't split the cache.
+
+```sh
+curl localhost:8000/v1/chat/completions -H "X-Cache-Tags: pricing, shop:v2" -d '{...}'
+```
+
+Then invalidate with any combination of filters (combined with AND):
+
+| Body | Clears |
+|---|---|
+| `{"model": "gemini-3.5-flash"}` | Everything that model generated |
+| `{"system_prompt": "You are a support agent."}` | Everything for that exact system prompt, across all models and parameters (`""` = requests without one) |
+| `{"system_prompt_hash": "7ec53d266067f78f"}` | The same, by the prompt's 16-char hash |
+| `{"tag": "pricing"}` | Entries with that tag |
+| `{"tag_prefix": "shop:"}` | Entries with a tag starting with `shop:` |
+| `{"all": true}` | The whole cache (can't be combined with filters) |
+
+Add `"dry_run": true` to see how many entries match without deleting. An empty body is rejected, so a missing filter can never wipe the cache.
+
+Set `ADMIN_TOKEN` to require `Authorization: Bearer <token>` on this endpoint. It's open when unset (fine on localhost), and the server logs a warning at startup.
+
+Entries cached before this feature have no system prompt hash or tags, so they can only be cleared by `model` or `all` (or they expire within 24 hours). When the app starts against an older index, it rebuilds the index definition automatically and keeps every cached entry.
 
 ## Costs (in Malaysian ringgit)
 
