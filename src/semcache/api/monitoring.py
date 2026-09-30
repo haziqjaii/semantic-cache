@@ -29,10 +29,10 @@ def prometheus_metrics() -> Response:
 @router.get("/analytics")
 async def get_analytics():
     """
-    Business metrics dashboard computing derived metrics like cost and time saved.
+    Business metrics dashboard: hit rates, tokens spent and saved, and the
+    money saved (the one figure in MYR; see PRICING_TABLE).
 
-    All costs are estimates in MYR, priced when each call happens (see
-    PRICING_TABLE). The same figures are exported to Prometheus at /metrics.
+    The same figures are exported to Prometheus at /metrics.
     """
     total_requests = (
         metrics.cache_hits
@@ -43,11 +43,6 @@ async def get_analytics():
     hit_rate = metrics.cache_hits / total_requests if total_requests > 0 else 0
     cacheable_requests = metrics.cache_hits + metrics.cache_misses
     hit_rate_cacheable = metrics.cache_hits / cacheable_requests if cacheable_requests > 0 else 0
-
-    # Each hit saved exactly what its cached answer originally cost; the
-    # classifier and embeddings are what the cache itself costs to run.
-    overhead_cost = metrics.classifier_cost_myr + metrics.embedding_cost_myr
-    net_cost_saved = metrics.cost_saved_myr - overhead_cost
 
     # Classifier stats
     total_classifier_calls = metrics.classifier_calls_success + metrics.classifier_calls_fallback
@@ -74,20 +69,20 @@ async def get_analytics():
             "hit_rate": hit_rate,
             "hit_rate_cacheable": hit_rate_cacheable,
         },
-        "cost": {
-            "llm_tokens_prompt": metrics.llm_tokens_prompt,
-            "llm_tokens_completion": metrics.llm_tokens_completion,
-            "classifier_tokens": metrics.classifier_tokens_total,
-            "embedding_tokens": metrics.embedding_tokens_total,
-            "estimated_llm_cost_myr": metrics.llm_cost_myr,
-            "estimated_classifier_cost_myr": metrics.classifier_cost_myr,
-            "estimated_embedding_cost_myr": metrics.embedding_cost_myr,
-            "estimated_cost_saved_myr": metrics.cost_saved_myr,
-            "net_cost_saved_myr": net_cost_saved,
-            # Estimates above exclude these: calls to models missing from
-            # PRICING_TABLE, and hits on entries cached without token counts.
-            "unpriced_llm_calls": metrics.llm_calls_unpriced,
-            "unpriced_cache_hits": metrics.cache_hits_unpriced,
+        "tokens": {
+            # LLM tokens actually used (prompt + completion) vs. avoided by hits.
+            "spent": metrics.llm_tokens_prompt + metrics.llm_tokens_completion,
+            "saved": metrics.tokens_saved,
+            "llm_prompt": metrics.llm_tokens_prompt,
+            "llm_completion": metrics.llm_tokens_completion,
+            "classifier": metrics.classifier_tokens_total,
+            "embedding_estimated": metrics.embedding_tokens_total,
+        },
+        "savings": {
+            "saved_myr": metrics.cost_saved_myr,
+            # saved_myr excludes hits on entries cached without token counts
+            # or whose model is missing from PRICING_TABLE.
+            "unpriced_hits": metrics.cache_hits_unpriced,
             "unpriced_models": sorted(metrics.unpriced_models),
         },
         "latency": {

@@ -77,6 +77,10 @@ class CacheEntry:
     # They group entries for invalidation; they don't partition the cache.
     tags: list[str] = field(default_factory=list)
 
+    # The classifier's category for the question ("factual", "how_to", ...),
+    # so thresholds can be learned per intent. None if unknown.
+    intent: str | None = None
+
     # The unique ID of this entry in the store (e.g., Redis key)
     id: str = ""
 

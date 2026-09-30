@@ -90,6 +90,20 @@
   .entries .meta { font-size: 12px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 2px; }
   .tag { font-size: 11px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 999px; padding: 0 7px; }
   .empty { color: var(--muted); font-size: 14px; }
+  .feedback { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 12px; font-size: 14px; }
+  .feedback button { padding: 4px 12px; }
+  .pair { font-size: 14px; overflow-wrap: anywhere; }
+  .pair .who { color: var(--muted); font-size: 12px; display: block; }
+  .nm-actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 6px; }
+  .nm-actions button { padding: 3px 10px; font-size: 13px; }
+  .labelled-good { color: var(--hit); font-weight: 600; font-size: 13px; }
+  .labelled-bad { color: var(--error); font-weight: 600; font-size: 13px; }
+  tr.current td { background: var(--hit-bg); }
+  .thresholds { list-style: none; margin: 10px 0 0; padding: 0; font-size: 14px; }
+  .thresholds li { display: flex; justify-content: space-between; gap: 8px; padding: 4px 0; border-bottom: 1px solid var(--border); }
+  .thresholds li:last-child { border-bottom: 0; }
+  .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 10px; }
+  .toolbar select { width: auto; }
 </style>
 </head>
 <body>
@@ -133,6 +147,11 @@
         <span id="r-status" class="badge"></span>
         <div class="facts" id="r-facts"></div>
         <pre class="answer" id="r-answer"></pre>
+        <div class="feedback" id="r-feedback" hidden>
+          <span>Was this cached answer right for your question?</span>
+          <button id="fb-yes">Yes</button><button id="fb-no">No</button>
+          <span class="muted" id="fb-status"></span>
+        </div>
       </div>
     </section>
 
@@ -146,6 +165,13 @@
         </table>
       </div>
     </section>
+
+    <section>
+      <h2>Near misses <span class="hint">almost matched a cached question</span><button id="nm-refresh">Refresh</button></h2>
+      <p class="muted" style="margin-top:0">Is it really the same question? Your answers teach the cache its thresholds.</p>
+      <p class="empty" id="nm-empty">Loading…</p>
+      <ul class="entries" id="near-misses"></ul>
+    </section>
   </div>
 
   <div class="col">
@@ -153,6 +179,27 @@
       <h2>Totals <span class="hint">since the server started</span></h2>
       <div class="tiles" id="tiles"></div>
       <p class="muted" id="totals-note"></p>
+    </section>
+
+    <section>
+      <h2>Threshold tuner <span class="hint">what if the threshold were…</span></h2>
+      <div class="toolbar">
+        <label for="tuner-intent" style="margin:0">Question type</label>
+        <select id="tuner-intent">
+          <option value="">All</option><option>factual</option><option>how_to</option>
+          <option>time_sensitive</option><option>classification</option>
+        </select>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Threshold</th><th>Would hit</th><th>Wrong answers <span class="muted">(of labelled)</span></th></tr></thead>
+          <tbody id="tuner"></tbody>
+        </table>
+      </div>
+      <p class="muted" id="tuner-note"></p>
+      <h2 style="margin-top:14px">Thresholds in use</h2>
+      <ul class="thresholds" id="thresholds"></ul>
+      <p class="muted" id="thresholds-note"></p>
     </section>
 
     <section>
@@ -257,6 +304,7 @@ async function send() {
         status: response.headers.get("X-Cache-Status") || "?",
         similarity: response.headers.get("X-Cache-Similarity"),
         reason: response.headers.get("X-Cache-Bypass-Reason"),
+        lookupId: response.headers.get("X-Cache-Lookup-Id"),
         answer: data.choices?.[0]?.message?.content ?? "",
         finishReason: data.choices?.[0]?.finish_reason,
         usage: data.usage,
@@ -272,8 +320,7 @@ async function send() {
   requests.unshift(record);
   showResult(record);
   renderHistory();
-  refreshTotals();
-  refreshEntries();
+  refreshAll();
 }
 
 function showResult(r) {
@@ -288,6 +335,27 @@ function showResult(r) {
   if (r.finishReason && r.finishReason !== "stop") facts.push(["Finish reason", `${r.finishReason} (not cached)`]);
   $("r-facts").replaceChildren(...facts.map(([k, v]) => el("span", {}, [k + ": ", el("b", { text: v })])));
   $("r-answer").textContent = r.error ?? r.answer;
+  // Feedback is only asked on hits: that's when a cached answer was served.
+  $("r-feedback").hidden = !(r.status === "HIT" && r.lookupId);
+  $("fb-status").textContent = "";
+  $("fb-yes").onclick = () => sendFeedback(r.lookupId, true, $("fb-status"));
+  $("fb-no").onclick = () => sendFeedback(r.lookupId, false, $("fb-status"));
+}
+
+// ── Feedback ────────────────────────────────────────────────
+async function sendFeedback(lookupId, goodMatch, statusEl) {
+  statusEl.textContent = "Saving…";
+  const response = await fetch("/v1/cache/feedback", {
+    method: "POST", headers: { "Content-Type": "application/json", ...adminHeaders() },
+    body: JSON.stringify({ lookup_id: lookupId, good_match: goodMatch }),
+  });
+  if (!response.ok) {
+    statusEl.textContent = response.status === 401 ? "Admin token required (under Invalidate)." : await errorText(response);
+    return;
+  }
+  statusEl.textContent = goodMatch ? "Thanks: marked as a good match." : "Thanks: marked as a wrong match.";
+  refreshTuner();
+  refreshNearMisses();
 }
 
 function renderHistory() {
@@ -314,7 +382,7 @@ async function refreshTotals() {
       fetch("/v1/analytics").then((r) => r.json()),
       fetch("/v1/cache/stats").then((r) => (r.ok ? r.json() : {})),
     ]);
-    const c = analytics.cache, cost = analytics.cost;
+    const c = analytics.cache, tokens = analytics.tokens, savings = analytics.savings;
     const tiles = [
       ["Hit rate", `${Math.round(c.hit_rate_cacheable * 100)}%`, "good"],
       ["Requests", c.total_requests],
@@ -322,16 +390,15 @@ async function refreshTotals() {
       ["Bypassed", c.cache_bypasses + c.cache_lookup_errors],
       ["Near misses", c.cache_near_misses],
       ["Cached entries", stats.total_entries ?? "–"],
-      ["Saved", formatRM(cost.estimated_cost_saved_myr), "good"],
-      ["LLM spend", formatRM(cost.estimated_llm_cost_myr)],
-      ["Cache overhead", formatRM(cost.estimated_classifier_cost_myr + cost.estimated_embedding_cost_myr)],
-      ["Net saved", formatRM(cost.net_cost_saved_myr), cost.net_cost_saved_myr > 0 ? "good" : ""],
+      ["Tokens spent", tokens.spent.toLocaleString()],
+      ["Tokens saved", tokens.saved.toLocaleString(), "good"],
+      ["Saved", formatRM(savings.saved_myr), "good"],
     ];
     $("tiles").replaceChildren(...tiles.map(([k, v, cls]) =>
       el("div", { class: `tile ${cls || ""}` }, [el("div", { class: "v", text: String(v) }), el("div", { class: "k", text: k })])));
-    const unpriced = cost.unpriced_models.length ? ` Not priced: ${cost.unpriced_models.join(", ")}.` : "";
+    const unpriced = savings.unpriced_models.length ? ` Not priced: ${savings.unpriced_models.join(", ")}.` : "";
     $("totals-note").textContent =
-      `Hit rate counts cacheable requests only. Costs are estimates at USD→MYR ${analytics.meta.usd_to_myr} (${analytics.meta.usd_to_myr_as_of}).${unpriced}`;
+      `Hit rate counts cacheable requests only. Tokens are LLM tokens. Savings are estimates at USD→MYR ${analytics.meta.usd_to_myr} (${analytics.meta.usd_to_myr_as_of}).${unpriced}`;
   } catch (err) {
     $("totals-note").textContent = `Couldn't load totals: ${err.message}`;
   }
@@ -363,8 +430,7 @@ async function invalidate(dryRun) {
   const data = await response.json();
   const n = dryRun ? data.matched : data.deleted;
   out.textContent = `${dryRun ? "Would delete" : "Deleted"} ${n} ${n === 1 ? "entry" : "entries"}.`;
-  refreshTotals();
-  refreshEntries();
+  refreshAll();
 }
 
 // ── Cached entries ──────────────────────────────────────────
@@ -393,6 +459,85 @@ async function refreshEntries() {
   ])));
 }
 
+// ── Near misses ─────────────────────────────────────────────
+async function refreshNearMisses() {
+  const response = await fetch("/v1/cache/near-misses?limit=20", { headers: adminHeaders() });
+  if (!response.ok) {
+    $("near-misses").replaceChildren();
+    $("nm-empty").hidden = false;
+    $("nm-empty").textContent = response.status === 401
+      ? "Set the admin token (under Invalidate) to see near misses." : await errorText(response);
+    return;
+  }
+  const body = await response.json();
+  $("nm-empty").hidden = body.near_misses.length > 0;
+  $("nm-empty").textContent = "No near misses yet. Try rewording a cached question more loosely.";
+  $("near-misses").replaceChildren(...body.near_misses.map((e) => {
+    const status = el("span", { class: "muted" });
+    const verdict = e.good_match === null ? null
+      : el("span", { class: e.good_match ? "labelled-good" : "labelled-bad",
+                     text: e.good_match ? "Labelled: same question" : "Labelled: different" });
+    const yes = el("button", { text: "Same question" });
+    const no = el("button", { text: "Different" });
+    yes.addEventListener("click", () => sendFeedback(e.lookup_id, true, status));
+    no.addEventListener("click", () => sendFeedback(e.lookup_id, false, status));
+    return el("li", {}, [
+      el("div", { class: "pair" }, [el("span", { class: "who", text: "Asked" }), e.prompt]),
+      el("div", { class: "pair" }, [el("span", { class: "who", text: "Closest cached question" }), e.candidate_prompt]),
+      el("div", { class: "meta" }, [
+        el("span", { text: `similarity ${e.similarity.toFixed(4)}` }),
+        el("span", { text: `needed ≥ ${e.required_similarity}` }),
+        el("span", { text: e.intent || "unknown type" }),
+      ]),
+      el("div", { class: "nm-actions" }, [yes, no, verdict, status]),
+    ]);
+  }));
+}
+
+// ── Threshold tuner ─────────────────────────────────────────
+async function refreshTuner() {
+  const intent = $("tuner-intent").value;
+  try {
+    const [tuner, thresholds] = await Promise.all([
+      fetch(`/v1/cache/tuner${intent ? `?intent=${intent}` : ""}`).then((r) => r.json()),
+      fetch("/v1/cache/thresholds").then((r) => r.json()),
+    ]);
+    const inUse = intent ? thresholds.intents.find((i) => i.intent === intent)?.in_use : null;
+    $("tuner").replaceChildren(...tuner.rows.map((row) => {
+      const wrong = row.labelled
+        ? `${row.wrong} of ${row.labelled} (${Math.round(row.wrong_rate * 100)}%)` : "–";
+      const current = row.threshold === inUse;
+      return el("tr", { class: current ? "current" : "" }, [
+        el("td", { class: "num", text: row.threshold.toFixed(2) + (current ? " (in use)" : "") }),
+        el("td", { class: "num", text: `${Math.round(row.hit_rate * 100)}% (${row.would_hit})` }),
+        el("td", { class: "num", text: wrong }),
+      ]);
+    }));
+    $("tuner-note").textContent = tuner.lookups_analysed
+      ? `Based on the last ${tuner.lookups_analysed} lookups (${tuner.labelled} labelled). Lower thresholds give more hits, but more wrong answers.`
+      : "No lookups yet: ask some questions first.";
+
+    const l = thresholds.learning;
+    $("thresholds").replaceChildren(...thresholds.intents.map((i) => el("li", {}, [
+      el("span", { text: i.intent }),
+      el("span", { class: "num", text: i.learned === null
+        ? `${i.in_use} (default, ${i.labels} of ${l.min_labels} labels to learn)`
+        : `${i.in_use} learned from ${i.labels} labels (default ${i.default})` }),
+    ])));
+    $("thresholds-note").textContent =
+      `A question type learns its own threshold after ${l.min_labels} labels: the lowest one where at least ${Math.round(l.target_precision * 100)}% of labelled matches were right.`;
+  } catch (err) {
+    $("tuner-note").textContent = `Couldn't load the tuner: ${err.message}`;
+  }
+}
+
+function refreshAll() {
+  refreshTotals();
+  refreshEntries();
+  refreshNearMisses();
+  refreshTuner();
+}
+
 // ── Wire up ─────────────────────────────────────────────────
 $("send").addEventListener("click", send);
 $("question").addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) send(); });
@@ -400,14 +545,16 @@ document.querySelectorAll("[data-q]").forEach((b) => b.addEventListener("click",
 $("inv-preview").addEventListener("click", () => invalidate(true));
 $("inv-delete").addEventListener("click", () => invalidate(false));
 $("entries-refresh").addEventListener("click", refreshEntries);
+$("nm-refresh").addEventListener("click", refreshNearMisses);
+$("tuner-intent").addEventListener("change", refreshTuner);
 try { $("token").value = localStorage.getItem("semcache-admin-token") || ""; } catch { /* storage unavailable */ }
 $("token").addEventListener("change", () => {
   try { localStorage.setItem("semcache-admin-token", $("token").value.trim()); } catch { /* storage unavailable */ }
   refreshEntries();
+  refreshNearMisses();
 });
 
-refreshTotals();
-refreshEntries();
+refreshAll();
 setInterval(refreshTotals, 5000);
 </script>
 </body>

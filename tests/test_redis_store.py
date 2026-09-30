@@ -9,6 +9,7 @@ Run with:
 
 import asyncio
 import os
+from datetime import UTC, datetime, timedelta
 
 import pytest
 import pytest_asyncio
@@ -307,3 +308,85 @@ async def test_list_entries_newest_first(store: RedisVectorStore):
     assert [e.prompt for e in entries] == ["newest", "middle"]
     assert entries[0].tags == ["t"]
     assert entries[0].id.startswith("semcache:entry:")
+
+
+# ── Lookup log (near misses, tuner, learning) ───────────────
+
+@pytest_asyncio.fixture
+async def lookup_log(store, redis_url):
+    """A RedisLookupLog on the same (already flushed) test database."""
+    from semcache.cache.lookup_log import RedisLookupLog
+
+    log = RedisLookupLog(redis_url=redis_url)
+    await log.initialize()
+    yield log
+    await log.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_lookup_log_round_trip_and_labels(lookup_log):
+    from semcache.cache.lookup_log import MISS, NEAR_MISS, LookupEvent
+
+    near = LookupEvent(prompt="Explain Python", model="m", outcome=NEAR_MISS, similarity=0.93,
+                       required_similarity=0.95, intent="factual", candidate_prompt="What is Python?")
+    miss = LookupEvent(prompt="Cake recipe", model="m", outcome=MISS)
+    await lookup_log.record(near)
+    await lookup_log.record(miss)
+
+    got = await lookup_log.get(near.id)
+    assert (got.similarity, got.intent, got.candidate_prompt, got.good_match) == (
+        0.93, "factual", "What is Python?", None)
+    assert (await lookup_log.get(miss.id)).similarity is None
+    assert [e.id for e in await lookup_log.recent()] == [miss.id, near.id]  # newest first
+
+    assert await lookup_log.label(near.id, good_match=True) is True
+    assert (await lookup_log.get(near.id)).good_match is True
+    assert [e.id for e in await lookup_log.labelled()] == [near.id]
+    # Labelled events are training data: they no longer expire.
+    assert await lookup_log._client.ttl(f"semcache:lookup:{near.id}") == -1
+
+    # Labelling an unknown id must not create a half-empty event.
+    assert await lookup_log.label("no-such-id", good_match=True) is False
+    assert await lookup_log._client.exists("semcache:lookup:no-such-id") == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_lookup_log_trims_old_events_but_keeps_labelled(lookup_log, monkeypatch):
+    from semcache.cache import lookup_log as module
+    from semcache.cache.lookup_log import NEAR_MISS, LookupEvent
+
+    monkeypatch.setattr(module, "MAX_RECENT_EVENTS", 3)
+    base = datetime(2026, 9, 30, tzinfo=UTC)
+    events = [
+        LookupEvent(prompt=f"q{i}", model="m", outcome=NEAR_MISS, similarity=0.93,
+                    created_at=base + timedelta(seconds=i))
+        for i in range(600)
+    ]
+    await lookup_log.record(events[0])
+    await lookup_log.label(events[0].id, good_match=False)
+    for event in events[1:]:
+        await lookup_log.record(event)
+
+    recent = await lookup_log.recent()
+    assert len(recent) <= 3 + 500  # trimmed in batches, never unbounded
+    assert recent[0].prompt == "q599"
+    # The oldest, labelled event left the recent list but is still kept for learning.
+    assert events[0].id not in {e.id for e in recent}
+    assert [e.id for e in await lookup_log.labelled()] == [events[0].id]
+    # Trimmed unlabelled events are deleted, not left to pile up.
+    assert await lookup_log._client.exists(f"semcache:lookup:{events[1].id}") == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_entry_intent_round_trip(store: RedisVectorStore):
+    emb = [1.0, 0.0, 0.0, 0.0]
+    await store.store(emb, _entry(intent="how_to"))
+    await store.store(emb, _entry(namespace="other"))
+
+    (entry, _), = await store.search(emb, "ns", threshold=0.9)
+    assert entry.intent == "how_to"
+    (entry, _), = await store.search(emb, "other", threshold=0.9)
+    assert entry.intent is None

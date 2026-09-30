@@ -205,32 +205,3 @@ class TestCacheEngine:
 
         stats = await engine.stats()
         assert stats["total_entries"] == 1
-
-    @pytest.mark.asyncio
-    async def test_lookup_records_embedding_cost(self, memory_store):
-        """Embedding calls are priced (in MYR) by the embedder's model."""
-        from semcache.config import PRICING_TABLE
-        from semcache.metrics import metrics
-        from tests.conftest import MockEmbedder
-
-        class PricedEmbedder(MockEmbedder):
-            model = "gemini-embedding-001"  # $0.15 per 1M tokens
-
-        engine = CacheEngine(embedder=PricedEmbedder(), store=memory_store)
-
-        await engine.lookup(prompt="x" * 4000, model="test-model")  # ~1000 tokens
-
-        assert metrics.embedding_tokens_total == 1000
-        expected = 1000 * 0.15 / 1_000_000 * PRICING_TABLE["usd_to_myr"]
-        assert metrics.embedding_cost_myr == pytest.approx(expected)
-
-    @pytest.mark.asyncio
-    async def test_unpriced_embedder_costs_nothing(self, mock_embedder, memory_store):
-        """The mock embedder has no model, so it adds no cost or unpriced noise."""
-        from semcache.metrics import metrics
-
-        engine = CacheEngine(embedder=mock_embedder, store=memory_store)
-        await engine.lookup(prompt="What is Python?", model="test-model")
-
-        assert metrics.embedding_cost_myr == 0
-        assert metrics.unpriced_models == set()

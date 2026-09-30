@@ -128,7 +128,7 @@ _ENTRY_FIELDS = [
     "prompt", "response", "model", "namespace",
     "created_at", "ttl_seconds", "hit_count",
     "required_similarity", "response_metadata",
-    "system_prompt_hash", "tags",
+    "system_prompt_hash", "tags", "intent",
 ]
 
 
@@ -151,6 +151,7 @@ def _entry_from_result(result: dict) -> CacheEntry:
         # Absent on entries cached before these fields existed.
         system_prompt_hash=result.get("system_prompt_hash", ""),
         tags=[t for t in result.get("tags", "").split(",") if t],
+        intent=result.get("intent") or None,
         id=result.get("id", ""),
     )
 
@@ -327,6 +328,7 @@ class RedisVectorStore(VectorStore):
             ),
             "system_prompt_hash": entry.system_prompt_hash,
             "tags": ",".join(entry.tags),
+            "intent": entry.intent or "",
         }
 
         # hset = "hash set" — sets multiple fields on a Redis Hash in one call.

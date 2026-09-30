@@ -22,11 +22,6 @@ from abc import ABC, abstractmethod
 class Embedder(ABC):
     """Interface that all embedding providers must implement."""
 
-    @property
-    def model(self) -> str | None:
-        """Model name used to price embedding calls; None if not billable."""
-        return None
-
     @abstractmethod
     async def embed(self, text: str) -> list[float]:
         """

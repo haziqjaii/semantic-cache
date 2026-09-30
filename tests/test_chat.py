@@ -256,54 +256,49 @@ async def test_bypass_records_llm_usage(mock_provider, mock_engine):
     assert metrics.llm_calls == 1
     assert metrics.llm_tokens_prompt == 100
     assert metrics.llm_tokens_completion == 40
-    # gemini-3.5-flash: (100 × $1.50/M + 40 × $9.00/M) in ringgit
-    assert metrics.llm_cost_myr == pytest.approx((100 * 1.50 + 40 * 9.00) / 1e6 * USD_TO_MYR)
 
 
-# ── Costs are in ringgit, priced by each call's own model ───
+# ── Savings: tokens and ringgit, priced by the cached answer's model ─
+
+def _hit_on(entry_model, prompt_tokens, completion_tokens):
+    entry = CacheEntry(
+        prompt="Hello", response="Cached", model=entry_model, namespace="ns",
+        response_metadata={"usage": {
+            "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }},
+    )
+    return LookupResult(hit=True, entry=entry, similarity=0.99, namespace="ns", embedding=[0.0])
+
 
 @pytest.mark.asyncio
-async def test_calls_are_priced_by_their_own_model(base_request, mock_engine):
-    provider = MagicMock(spec=LLMProvider)
-    provider.generate = AsyncMock(side_effect=[
-        _response("A", 1_000_000, 0, model="gemini-3.5-flash"),       # $1.50
-        _response("B", 1_000_000, 0, model="gemini-3.5-flash-lite"),  # $0.075
+async def test_savings_are_priced_by_each_entry_model(base_request, mock_provider, mock_engine):
+    mock_engine.lookup = AsyncMock(side_effect=[
+        _hit_on("gemini-3.5-flash", 1_000_000, 0),       # $1.50
+        _hit_on("gemini-3.5-flash-lite", 1_000_000, 0),  # $0.075
     ])
 
-    await chat_completions(base_request, Response(), mock_engine, provider, _classifier())
-    await chat_completions(base_request, Response(), mock_engine, provider, _classifier())
+    await chat_completions(base_request, Response(), mock_engine, mock_provider, _classifier())
+    await chat_completions(base_request, Response(), mock_engine, mock_provider, _classifier())
 
-    assert metrics.llm_cost_myr == pytest.approx((1.50 + 0.075) * USD_TO_MYR)
-    assert metrics.llm_calls_unpriced == 0
-
-
-@pytest.mark.asyncio
-async def test_classifier_cost_is_recorded(base_request, mock_provider, mock_engine):
-    classifier = MagicMock(spec=IntentClassifier)
-    classifier.classify_safe = AsyncMock(return_value=ClassifierResult(
-        policy=DEFAULT_POLICY, tokens=1_000_000, is_fallback=False,
-        model="gemini-3.5-flash-lite",
-    ))
-
-    await chat_completions(base_request, Response(), mock_engine, mock_provider, classifier)
-
-    assert metrics.classifier_cost_myr == pytest.approx(0.075 * USD_TO_MYR)
+    assert metrics.tokens_saved == 2_000_000
+    assert metrics.cost_saved_myr == pytest.approx((1.50 + 0.075) * USD_TO_MYR)
+    assert metrics.cache_hits_unpriced == 0
 
 
 @pytest.mark.asyncio
-async def test_unknown_model_is_counted_as_unpriced(base_request, mock_provider, mock_engine):
-    mock_provider.generate = AsyncMock(
-        return_value=_response("Answer", 10, 20, model="gemini-9-ultra")
-    )
+async def test_hit_on_unknown_model_saves_tokens_but_is_unpriced(
+    base_request, mock_provider, mock_engine
+):
+    mock_engine.lookup = AsyncMock(return_value=_hit_on("gemini-9-ultra", 10, 20))
 
     await chat_completions(base_request, Response(), mock_engine, mock_provider, _classifier())
 
-    assert metrics.llm_calls == 1
-    assert metrics.llm_tokens_prompt == 10
-    assert metrics.llm_calls_unpriced == 1
+    assert metrics.tokens_saved == 30
+    assert metrics.cache_hits_unpriced == 1
     assert metrics.unpriced_models == {"gemini-9-ultra"}
     # Not priced as some other model.
-    assert metrics.llm_cost_myr == 0
+    assert metrics.cost_saved_myr == 0
 
 
 # ── Only normally-finished responses are cached ─────────────
@@ -457,6 +452,7 @@ async def test_hit_returns_stored_usage_and_credits_exact_saving(
     # The hit saved what the original gemini-3.5-flash call cost.
     expected = (1000 * 1.50 + 2000 * 9.00) / 1e6 * USD_TO_MYR
     assert metrics.cost_saved_myr == pytest.approx(expected)
+    assert metrics.tokens_saved == 3000
     assert metrics.cache_hits_unpriced == 0
     mock_provider.generate.assert_not_called()
 
@@ -497,6 +493,7 @@ async def test_miss_then_hit_round_trip(mock_provider, mock_embedder, memory_sto
     assert miss.headers["X-Cache-Status"] == "MISS"
     assert hit.headers["X-Cache-Status"] == "HIT"
     assert cached.usage == UsageInfo(prompt_tokens=100, completion_tokens=200, total_tokens=300)
-    # Spend and saving are the same call, so they match exactly.
-    assert metrics.cost_saved_myr == pytest.approx(metrics.llm_cost_myr)
+    # The hit saved exactly what the miss spent.
+    assert metrics.tokens_saved == metrics.llm_tokens_prompt + metrics.llm_tokens_completion == 300
+    assert metrics.cost_saved_myr == pytest.approx((100 * 1.50 + 200 * 9.00) / 1e6 * USD_TO_MYR)
     assert mock_provider.generate.await_count == 1
