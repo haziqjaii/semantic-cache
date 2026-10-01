@@ -28,6 +28,13 @@ from google import genai
 from google.genai import types
 
 from semcache.embeddings.base import Embedder
+from semcache.metrics import metrics
+
+
+def _count_call(texts: list[str]) -> None:
+    """Count embedding API usage. The API doesn't report tokens, so estimate ~4 characters per token."""
+    metrics.embedding_calls += 1
+    metrics.embedding_tokens_total += sum(len(text) for text in texts) // 4
 
 
 class GeminiEmbedder(Embedder):
@@ -63,6 +70,7 @@ class GeminiEmbedder(Embedder):
         """
         Embed a single text string using the async client.
         """
+        _count_call([text])
         response = await self._client.aio.models.embed_content(
             model=self._model,
             contents=text,
@@ -80,6 +88,7 @@ class GeminiEmbedder(Embedder):
         if not texts:
             return []
 
+        _count_call(texts)
         response = await self._client.aio.models.embed_content(
             model=self._model,
             contents=texts,

@@ -15,7 +15,9 @@ from semcache.cache.lookup_log import RedisLookupLog
 from semcache.cache.policy import CachePolicy, TTLTier
 from semcache.cache.store.redis_store import RedisVectorStore
 from semcache.config import get_settings
+from semcache.embeddings.base import Embedder
 from semcache.embeddings.gemini import GeminiEmbedder
+from semcache.embeddings.memory import CachedEmbedder, RedisEmbeddingStore
 from semcache.metrics import CacheMetricsCollector
 from semcache.providers.base import LLMProvider
 from semcache.providers.gemini import GeminiProvider
@@ -90,12 +92,23 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     )
     await store.initialize()
 
-    # 2. Initialize Embedder
-    embedder = GeminiEmbedder(
+    # 2. Initialize Embedder, wrapped in the embedding memory so a text
+    # seen before isn't sent to the embedding API again.
+    embedder: Embedder = GeminiEmbedder(
         api_key=settings.gemini_api_key,
         model=settings.embedding_model,
         dims=settings.embedding_dims,
     )
+    embedding_store: RedisEmbeddingStore | None = None
+    if settings.embedding_cache_ttl_seconds > 0:
+        embedding_store = RedisEmbeddingStore(redis_url=settings.redis_url)
+        await embedding_store.initialize()
+        embedder = CachedEmbedder(
+            embedder,
+            embedding_store,
+            identity=f"{settings.embedding_model}:{settings.embedding_dims}",
+            ttl_seconds=settings.embedding_cache_ttl_seconds,
+        )
 
     # Map the configured TTL seconds to the closest TTLTier
     tier = next(
@@ -149,6 +162,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await task
     except asyncio.CancelledError:
         pass
+    if embedding_store is not None:
+        await embedding_store.close()
     await lookup_log.close()
     await store.close()
 

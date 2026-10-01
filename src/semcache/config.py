@@ -34,6 +34,10 @@ class Settings(BaseSettings):
     # ── Embedding ───────────────────────────────────────────
     embedding_model: str = "gemini-embedding-001"
     embedding_dims: int = 768
+    # How long the embedding of a text is remembered, so the same text
+    # isn't sent to the embedding API twice (see embeddings/memory.py).
+    # 0 turns the memory off. Default: 7 days.
+    embedding_cache_ttl_seconds: int = 7 * 24 * 3600
 
     # ── Cache Behavior ──────────────────────────────────────
     default_similarity_threshold: float = 0.95

@@ -78,6 +78,12 @@ async def get_analytics():
             "classifier": metrics.classifier_tokens_total,
             "embedding_estimated": metrics.embedding_tokens_total,
         },
+        "embeddings": {
+            # Calls to the embedding API, and texts answered from the
+            # embedding memory instead (no API call).
+            "api_calls": metrics.embedding_calls,
+            "remembered": metrics.embedding_cache_hits,
+        },
         "savings": {
             "saved_myr": metrics.cost_saved_myr,
             # saved_myr excludes hits on entries cached without token counts
