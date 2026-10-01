@@ -34,6 +34,12 @@ FAILURE HANDLING:
     The classifier MUST NEVER break the user-facing response. If it
     times out, hits a rate limit, or returns garbage, we fall back to
     DEFAULT_POLICY and log the error. The user still gets their answer.
+
+    Brief Google errors ("overloaded" 503, "internal" 500, "too many
+    requests" 429) are retried first, after 1 s, 2 s and 4 s. The user
+    never waits for the classifier (it finishes after the response is
+    sent), so retrying costs them nothing, and each fallback avoided is
+    an answer cached with the right policy.
 """
 
 from __future__ import annotations
@@ -127,6 +133,16 @@ def _parse_category(reply: str) -> str | None:
     return named[0] if len(named) == 1 else None
 
 
+# Waits before each retry of a brief Google error (see FAILURE HANDLING).
+RETRY_DELAYS_SECONDS = (1.0, 2.0, 4.0)
+
+
+def _is_brief_error(exc: Exception) -> bool:
+    """A Google error worth retrying: rate-limited (429) or a server-side failure (5xx)."""
+    code = getattr(exc, "code", None)  # google.genai.errors.APIError carries the HTTP status
+    return isinstance(code, int) and (code == 429 or code >= 500)
+
+
 @dataclass
 class ClassifierResult:
     policy: CachePolicy
@@ -152,10 +168,12 @@ class IntentClassifier:
         model: str = "gemini-3.5-flash-lite",
         timeout_seconds: float = 5.0,
         default_policy: CachePolicy | None = None,
+        retry_delays: tuple[float, ...] = RETRY_DELAYS_SECONDS,
     ) -> None:
         self._client = genai.Client(api_key=api_key)
         self._model = model
         self._timeout = timeout_seconds
+        self._retry_delays = retry_delays
         # Used on failure or an unknown category. Pass the engine's
         # configured default so DEFAULT_SIMILARITY_THRESHOLD / DEFAULT_TTL_SECONDS
         # actually take effect.
@@ -223,14 +241,20 @@ class IntentClassifier:
         """
         Safe wrapper around classify() that NEVER raises.
 
-        If anything goes wrong (timeout, rate limit, malformed output,
-        network error), we log it and return the default policy and 0 tokens.
-        The user's request is never affected.
+        Brief Google errors (429, 5xx) are retried after each of the
+        retry delays. If it still fails, or anything else goes wrong
+        (timeout, malformed output, network error), we log it and return
+        the default policy and 0 tokens. The user's request is never affected.
 
         This is what chat.py should always call.
         """
-        try:
-            return await self.classify(prompt)
-        except Exception:
-            logger.exception("Classifier failed, falling back to default policy")
-            return ClassifierResult(policy=self._default_policy, tokens=0, is_fallback=True)
+        for retry_delay in (*self._retry_delays, None):
+            try:
+                return await self.classify(prompt)
+            except Exception as exc:
+                if retry_delay is None or not _is_brief_error(exc):
+                    logger.exception("Classifier failed, falling back to default policy")
+                    return ClassifierResult(policy=self._default_policy, tokens=0, is_fallback=True)
+                logger.warning("Classifier got %s; retrying in %.0f s", getattr(exc, "code", "?"), retry_delay)
+                await asyncio.sleep(retry_delay)
+        raise AssertionError("unreachable")  # the last attempt always returns
