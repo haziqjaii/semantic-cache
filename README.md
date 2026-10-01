@@ -33,7 +33,8 @@ flowchart LR
     C --> D[Search Redis: 5 nearest cached<br/>questions in the same namespace]
     D -->|one clears its own threshold| H[HIT: replay the cached answer]
     D -->|none does| M[MISS: ask the LLM,<br/>return the answer at once]
-    M -.after the response.-> K[Classify the question] -.TTL and threshold.-> S[(Store in Redis)]
+    M -. after the response .-> K[Classify the question]
+    K -. TTL and threshold .-> S[(Store in Redis)]
 ```
 
 1. **What can be cached:** single-turn requests (one question, optional system prompt). Multi-turn conversations pass straight through (`BYPASS`).
