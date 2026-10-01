@@ -170,6 +170,51 @@ class TestWrongAnswers:
         ]
         assert find_wrong_hits(results) == ([], 0)
 
+    def test_the_matched_question_decides_not_the_answer_text(self):
+        """Two reviews, one identical answer: only the matched question tells them apart."""
+        battery = "Review: 'The battery died after two days.'"
+        stopped = "Review: 'It stopped working within a week.'"
+        negative = "This review is negative."
+        results = [
+            _result(0, MISS, family="sentiment:battery", prompt=battery, answer=negative),
+            _result(1, MISS, family="sentiment:stopped", prompt=stopped, answer=negative),
+            # Asked about the battery, answered from the battery entry: right.
+            _result(2, HIT, family="sentiment:battery", prompt=battery, answer=negative, matched_prompt=battery),
+            # Asked about the battery, answered from the OTHER review: wrong,
+            # even though the answer happens to be correct.
+            _result(3, HIT, family="sentiment:battery", prompt=battery, answer=negative,
+                    matched_prompt=stopped, similarity=0.908),
+        ]
+        wrong, unverified = find_wrong_hits(results)
+
+        assert [r.index for r in wrong] == [3]
+        assert unverified == 0
+        (example,) = summarize(results)["wrong_answers"]["examples"]
+        assert (example["asked"], example["matched"]) == (battery, stopped)
+
+    def test_without_the_match_a_shared_answer_text_cant_be_checked(self):
+        """The old check guessed from the answer text, and counted these as wrong."""
+        results = [
+            _result(0, MISS, family="sentiment:a", answer="This review is negative."),
+            _result(1, MISS, family="sentiment:b", answer="This review is negative."),
+            _result(2, HIT, family="sentiment:a", answer="This review is negative."),
+        ]
+        assert find_wrong_hits(results) == ([], 1)
+
+    def test_a_match_cached_before_the_run_cant_be_checked(self):
+        results = [_result(0, HIT, family="f1", prompt="q", matched_prompt="asked in an earlier run")]
+        assert find_wrong_hits(results) == ([], 1)
+
+    def test_markdown_lists_the_wrong_matches(self):
+        results = [
+            _result(0, MISS, family="a", prompt="Question A"),
+            _result(1, HIT, family="b", prompt="Question B", matched_prompt="Question A", similarity=0.9081),
+        ]
+        markdown = render_markdown(summarize(results), title="t", settings={})
+
+        assert "| Wrong answers | 1 of 1 hits (100.0%) were answered from a different question |" in markdown
+        assert "| Question B | Question A | 0.908 | A |" in markdown
+
 
 def test_markdown_report_has_the_headline_rows():
     results = [_result(0, MISS, latency=2.0)] + [_result(i, HIT, latency=0.5) for i in range(1, 4)]
@@ -188,8 +233,10 @@ def test_markdown_report_has_the_headline_rows():
 REQUEST = Request(index=0, family="capital:Japan", kind="capital", text="What is the capital of Japan?")
 
 
-def _ok(status="MISS", similarity=None) -> httpx.Response:
+def _ok(status="MISS", similarity=None, lookup_id=None) -> httpx.Response:
     headers = {"x-cache-status": status}
+    if lookup_id:
+        headers["x-cache-lookup-id"] = lookup_id
     if similarity:
         headers["x-cache-similarity"] = similarity
     return httpx.Response(200, headers=headers, json={
@@ -202,6 +249,28 @@ def _client(handler) -> httpx.AsyncClient:
     return httpx.AsyncClient(base_url="http://cache.test", transport=httpx.MockTransport(handler))
 
 
+@pytest.mark.asyncio
+async def test_attach_matches_asks_the_server_what_each_hit_matched():
+    from loadtest.run import attach_matches
+
+    def handler(request):
+        lookup_id = request.url.path.rsplit("/", 1)[-1]
+        if lookup_id == "expired":
+            return httpx.Response(404)
+        return httpx.Response(200, json={"lookup": {"candidate_prompt": f"cached question for {lookup_id}"}})
+
+    results = [
+        _result(0, MISS, lookup_id="m0"),
+        _result(1, HIT, lookup_id="h1"),
+        _result(2, HIT, lookup_id="expired"),
+        _result(3, HIT),  # no lookup id (e.g. lookup logging off)
+    ]
+    found = await attach_matches(_client(handler), results)
+
+    assert found == 1
+    assert [r.matched_prompt for r in results] == [None, "cached question for h1", None, None]
+
+
 class TestSend:
     @pytest.mark.asyncio
     async def test_successful_request(self):
@@ -209,7 +278,7 @@ class TestSend:
 
         def handler(request):
             sent.update(json.loads(request.content))
-            return _ok("HIT", "0.9731")
+            return _ok("HIT", "0.9731", lookup_id="abc123")
 
         result = await send(_client(handler), REQUEST, "gemini-3.5-flash-lite")
 
@@ -221,6 +290,8 @@ class TestSend:
         assert (result.status, result.similarity, result.answer) == (HIT, 0.9731, "Tokyo.")
         assert (result.prompt_tokens, result.completion_tokens, result.retries) == (12, 3, 0)
         assert result.family == "capital:Japan"
+        assert result.prompt == "What is the capital of Japan?"
+        assert result.lookup_id == "abc123"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("busy_status", [429, 502, 503])

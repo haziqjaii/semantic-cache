@@ -76,6 +76,18 @@ async def feedback(
     return {"lookup": _event_json(event), "learned_thresholds": engine.learned_thresholds}
 
 
+@router.get("/lookups/{lookup_id}", dependencies=[Depends(require_admin)])
+async def lookup(lookup_id: str, engine: Annotated[CacheEngine, Depends(get_engine)]) -> dict:
+    """
+    One lookup, by the id in its X-Cache-Lookup-Id header: on a hit,
+    candidate_prompt is the cached question whose answer was served.
+    """
+    event = await engine.get_lookup(lookup_id)
+    if event is None:
+        raise HTTPException(status_code=404, detail=f"No lookup with id {lookup_id!r} (unknown or expired).")
+    return {"lookup": _event_json(event)}
+
+
 @router.get("/near-misses", dependencies=[Depends(require_admin)])
 async def near_misses(
     engine: Annotated[CacheEngine, Depends(get_engine)],
