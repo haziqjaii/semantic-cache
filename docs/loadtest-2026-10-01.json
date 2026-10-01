@@ -1,0 +1,220 @@
+{
+  "requests": 2000,
+  "outcomes": {
+    "HIT": 1735,
+    "MISS": 265,
+    "BYPASS": 0,
+    "ERROR": 0
+  },
+  "retries": 9,
+  "hit_rate": 0.8675,
+  "convergence": [
+    {
+      "through_request": 100,
+      "hit_rate": 0.43
+    },
+    {
+      "through_request": 200,
+      "hit_rate": 0.69
+    },
+    {
+      "through_request": 300,
+      "hit_rate": 0.75
+    },
+    {
+      "through_request": 400,
+      "hit_rate": 0.84
+    },
+    {
+      "through_request": 500,
+      "hit_rate": 0.85
+    },
+    {
+      "through_request": 600,
+      "hit_rate": 0.89
+    },
+    {
+      "through_request": 700,
+      "hit_rate": 0.85
+    },
+    {
+      "through_request": 800,
+      "hit_rate": 0.88
+    },
+    {
+      "through_request": 900,
+      "hit_rate": 0.95
+    },
+    {
+      "through_request": 1000,
+      "hit_rate": 0.91
+    },
+    {
+      "through_request": 1100,
+      "hit_rate": 0.92
+    },
+    {
+      "through_request": 1200,
+      "hit_rate": 0.88
+    },
+    {
+      "through_request": 1300,
+      "hit_rate": 0.93
+    },
+    {
+      "through_request": 1400,
+      "hit_rate": 0.92
+    },
+    {
+      "through_request": 1500,
+      "hit_rate": 0.94
+    },
+    {
+      "through_request": 1600,
+      "hit_rate": 0.94
+    },
+    {
+      "through_request": 1700,
+      "hit_rate": 0.98
+    },
+    {
+      "through_request": 1800,
+      "hit_rate": 0.95
+    },
+    {
+      "through_request": 1900,
+      "hit_rate": 0.93
+    },
+    {
+      "through_request": 2000,
+      "hit_rate": 0.92
+    }
+  ],
+  "by_kind": {
+    "author": {
+      "requests": 190,
+      "hit_rate": 0.8947368421052632
+    },
+    "capital": {
+      "requests": 796,
+      "hit_rate": 0.949748743718593
+    },
+    "concept": {
+      "requests": 354,
+      "hit_rate": 0.8813559322033898
+    },
+    "creative": {
+      "requests": 96,
+      "hit_rate": 0.0
+    },
+    "how_to": {
+      "requests": 306,
+      "hit_rate": 0.9019607843137255
+    },
+    "sentiment": {
+      "requests": 208,
+      "hit_rate": 0.9519230769230769
+    },
+    "weather": {
+      "requests": 50,
+      "hit_rate": 0.46
+    }
+  },
+  "latency_seconds": {
+    "hit": {
+      "count": 1735,
+      "p50": 0.053234799997881055,
+      "p95": 0.5264134999597445,
+      "p99": 0.8839455998968333,
+      "mean": 0.11985219112296806
+    },
+    "miss": {
+      "count": 265,
+      "p50": 1.2385442999657243,
+      "p95": 2.0938777000410482,
+      "p99": 3.8186774000059813,
+      "mean": 1.3201971592473851
+    },
+    "speedup": {
+      "p50": 23.265688985682733,
+      "p95": 3.977629183524301,
+      "p95_reduction": 0.7485939604068448
+    }
+  },
+  "tokens": {
+    "spent": 12029,
+    "saved": 72184,
+    "without_cache": 84213,
+    "saved_share": 0.8571598209302602
+  },
+  "wrong_answers": {
+    "count": 6,
+    "share_of_hits": 0.00345821325648415,
+    "unverified_hits": 0,
+    "examples": [
+      {
+        "asked": "Is this review positive or negative? 'The battery died after two days and support never replied.'",
+        "matched": "Is this review positive or negative? 'It stopped working within a week.'",
+        "similarity": 0.9084,
+        "answer": "This review is negative."
+      },
+      {
+        "asked": "Is this review positive or negative? 'The battery died after two days and support never replied.'",
+        "matched": "Is this review positive or negative? 'It stopped working within a week.'",
+        "similarity": 0.9084,
+        "answer": "This review is negative."
+      },
+      {
+        "asked": "Classify the sentiment of this review as positive or negative: 'The battery died after two days and support never replied.'",
+        "matched": "Is this review positive or negative? 'It stopped working within a week.'",
+        "similarity": 0.9022,
+        "answer": "This review is negative."
+      },
+      {
+        "asked": "Is this review positive or negative? 'The battery died after two days and support never replied.'",
+        "matched": "Is this review positive or negative? 'It stopped working within a week.'",
+        "similarity": 0.9084,
+        "answer": "This review is negative."
+      },
+      {
+        "asked": "Is this review positive or negative? 'The battery died after two days and support never replied.'",
+        "matched": "Is this review positive or negative? 'It stopped working within a week.'",
+        "similarity": 0.9084,
+        "answer": "This review is negative."
+      },
+      {
+        "asked": "Is this review positive or negative? 'The battery died after two days and support never replied.'",
+        "matched": "Is this review positive or negative? 'It stopped working within a week.'",
+        "similarity": 0.9084,
+        "answer": "This review is negative."
+      }
+    ]
+  },
+  "settings": {
+    "model": "gemini-3.5-flash-lite",
+    "requests": 2000,
+    "concurrency": 4,
+    "rps": 1.5,
+    "seed": 7,
+    "duration": "31.4 min",
+    "llm calls": 265,
+    "llm rpm limit": 12
+  },
+  "saved_myr": 0.060122040000000466,
+  "workload": {
+    "requests": 2000,
+    "families": 159,
+    "distinct_wordings": 419,
+    "by_kind": {
+      "author": 190,
+      "capital": 796,
+      "concept": 354,
+      "creative": 96,
+      "how_to": 306,
+      "sentiment": 208,
+      "weather": 50
+    },
+    "minimum_llm_calls": 244,
+    "best_possible_hit_rate": 0.878
+  }
+}
