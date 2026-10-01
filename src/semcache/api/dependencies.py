@@ -36,6 +36,7 @@ async def refresh_cache_gauges(engine: CacheEngine) -> None:
     CacheMetricsCollector._cache_entries = stats.get("total_entries", 0)
     CacheMetricsCollector._evicted_keys = stats.get("evicted_keys", 0)
     CacheMetricsCollector._expired_keys = stats.get("expired_keys", 0)
+    CacheMetricsCollector._thresholds = engine.thresholds_in_use()
 
 
 async def gauge_refresh_loop(engine: CacheEngine) -> None:
@@ -51,8 +52,8 @@ async def gauge_refresh_loop(engine: CacheEngine) -> None:
     failing = False
     while True:
         try:
-            await refresh_cache_gauges(engine)
             await engine.refresh_learned_thresholds()
+            await refresh_cache_gauges(engine)
         except Exception:
             if not failing:
                 logger.exception(

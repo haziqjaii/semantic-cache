@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import MISSING, dataclass, field, fields
+from typing import ClassVar
 
 from prometheus_client import Histogram
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
@@ -114,6 +115,7 @@ class CacheMetricsCollector:
     _cache_entries = 0
     _evicted_keys = 0
     _expired_keys = 0
+    _thresholds: ClassVar[dict[str, float]] = {}  # intent → similarity threshold in use
 
     def collect(self):
         # 1. Cache outcomes
@@ -169,6 +171,16 @@ class CacheMetricsCollector:
         g_exp = GaugeMetricFamily("semcache_expired_keys_total", "Total keys expired in cache")
         g_exp.add_metric([], self._expired_keys)
         yield g_exp
+
+        # Charted next to the hit rate, this shows what a threshold change did.
+        g_threshold = GaugeMetricFamily(
+            "semcache_similarity_threshold",
+            "Similarity threshold in use per intent (default, or learned from feedback)",
+            labels=["intent"],
+        )
+        for intent, threshold in sorted(self._thresholds.items()):
+            g_threshold.add_metric([intent], threshold)
+        yield g_threshold
 
         g_uptime = GaugeMetricFamily("semcache_uptime_seconds", "Process uptime in seconds")
         g_uptime.add_metric([], time.time() - process_start_time)

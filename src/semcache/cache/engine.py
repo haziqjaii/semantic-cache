@@ -37,7 +37,12 @@ from datetime import UTC, datetime
 
 from semcache.cache.keys import build_namespace, hash_system_prompt
 from semcache.cache.lookup_log import HIT, MISS, NEAR_MISS, LookupEvent, LookupLog
-from semcache.cache.policy import DEFAULT_POLICY, FLOOR_THRESHOLD, CachePolicy
+from semcache.cache.policy import (
+    DEFAULT_POLICY,
+    FLOOR_THRESHOLD,
+    TASK_POLICIES,
+    CachePolicy,
+)
 from semcache.cache.store.base import CacheEntry, EntryFilter, VectorStore
 from semcache.cache.tuning import LearnedThreshold, learn_thresholds
 from semcache.embeddings.base import Embedder
@@ -275,6 +280,14 @@ class CacheEngine:
     def learned_thresholds(self) -> dict[str, float]:
         """Per-intent thresholds currently in use, learned from feedback."""
         return dict(self._learned_thresholds)
+
+    def thresholds_in_use(self) -> dict[str, float]:
+        """The threshold each cacheable intent uses now: learned, else its default."""
+        return {
+            intent: self._learned_thresholds.get(intent, policy.similarity_threshold)
+            for intent, policy in TASK_POLICIES.items()
+            if policy.ttl_seconds > 0
+        }
 
     async def refresh_learned_thresholds(self) -> dict[str, LearnedThreshold]:
         """Re-learn per-intent thresholds from every labelled lookup."""
