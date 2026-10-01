@@ -1,6 +1,76 @@
 # Semantic Cache for LLMs
 
-A semantic caching proxy for LLM APIs, designed to cut latency and API costs.
+A caching proxy for LLM APIs that notices when a question has been asked before **in different words** and serves the earlier answer, so the LLM is called (and paid) once instead of every time. It speaks the OpenAI chat API, so an existing app only changes its base URL.
+
+"What is the capital of Japan?" and "Tell me Japan's capital." have the same answer, but a normal cache sees two different strings. This one compares their **meaning** (embeddings), and decides per type of question how close is close enough, and how long an answer stays fresh.
+
+## Results
+
+A 2,000-request load test of realistic traffic (159 questions in 419 wordings, a few asked constantly and most rarely), run on the Gemini free tier:
+
+| | |
+|---|---|
+| **Hit rate** | **86.8%**: 1,735 of 2,000 requests answered from the cache. The workload allows at most 87.8% (every question's first appearance must miss), and an exact-match cache could have served at most 75.4%. |
+| **LLM tokens saved** | **85.7%** (72,184 of 84,213) |
+| **Latency, cached vs. uncached** | p50 **0.05 s vs 1.24 s** (23× faster); p95 0.53 s vs 2.09 s (75% lower) |
+| **Wrong answers** | **6 of 1,735 hits (0.3%)** were answered from a different question (see below) |
+| **Errors** | 0. Retries absorbed Google's brief errors: 9 rate-limited answers (retried by the client) and 4 classifier calls; no classification fell back to the default policy |
+| Embedding calls | 420 instead of 2,000, thanks to the embedding memory |
+
+The hit rate starts at 43% (first 100 requests) and settles at 90–98% once the popular questions are cached. Full report and method: [docs/loadtest-2026-10-01.md](docs/loadtest-2026-10-01.md).
+
+![Grafana during the load test](docs/grafana-loadtest.png)
+
+**What the wrong answers showed.** All 6 were the same pair: *"The battery died after two days and support never replied."* matched the cached review *"It stopped working within a week."* at similarity 0.902–0.908, just over the classification threshold of **0.90**. Both reviews are negative, so the answer served was right, but by luck. When the question's *content* decides the answer, 0.90 is too loose. This is what the feedback loop is for, and it worked live during the run: 16 weather near misses were labelled by hand, and the cache learned a time-sensitive threshold of **0.93** (from 0.97) that let same-city rewordings ("weather in London" ↔ "raining in London", 0.954–0.965) hit while still rejecting different cities (≤ 0.92). Weather hits rose from 33% to 65% (small samples).
+
+## How it works
+
+```mermaid
+flowchart LR
+    A[App, using the OpenAI API] -->|chat request| B{Single-turn?}
+    B -->|no| L[LLM]
+    B -->|yes| C[Embed the question<br/>remembered per text]
+    C --> D[Search Redis: 5 nearest cached<br/>questions in the same namespace]
+    D -->|one clears its own threshold| H[HIT: replay the cached answer]
+    D -->|none does| M[MISS: ask the LLM,<br/>return the answer at once]
+    M -.after the response.-> K[Classify the question] -.TTL and threshold.-> S[(Store in Redis)]
+```
+
+1. **What can be cached:** single-turn requests (one question, optional system prompt). Multi-turn conversations pass straight through (`BYPASS`).
+2. **Namespace:** model, system prompt, temperature and `max_tokens` are hashed into a namespace, and answers are only ever reused within the same one.
+3. **Embed** the question with `gemini-embedding-001`. Each text's vector is remembered in Redis, so a repeated text costs no API call.
+4. **Search** Redis's vector index (HNSW, cosine) for the 5 nearest cached questions. Each entry carries **its own required similarity**, set by the kind of question it was, and the closest entry that clears its own bar is served.
+5. **On a miss**, the LLM's answer goes straight back to the user. Only then does a classifier label the question, which sets how long the answer is kept and how similar a future question must be:
+
+   | Question type | Kept for | Required similarity | Example |
+   |---|---|---|---|
+   | factual | 24 h | 0.95 | "What is the capital of Japan?" |
+   | how_to | 1 h | 0.93 | "How do I reverse a list in Python?" |
+   | time_sensitive | 5 min | 0.97 | "What's the weather in KL today?" |
+   | classification | 24 h | 0.90 | "Is this review positive or negative?" |
+   | creative | never cached | | "Write a poem about rain." |
+
+6. **Learn from feedback:** every lookup is logged with its closest match. People label hits and near misses as right or wrong, and once a question type has 10 labels, its threshold is re-learned (see [Tuning thresholds](#tuning-thresholds-near-misses-feedback-and-learning)).
+
+The stack: **FastAPI** (Python 3.13, `uv`), **Redis Stack** (vector search via RedisVL), **Gemini** (`google-genai`), **Prometheus** and **Grafana**, all in **Docker Compose**.
+
+## Design decisions
+
+* **The similarity threshold belongs to the cached entry, not the request.** A factual answer can be reused for a question at 0.95; a weather report needs 0.97, because "weather in Tokyo" and "weather in Toronto" have a similarity of 0.92 but different answers. Searching the 5 nearest entries (not just 1) lets a looser entry be found behind a stricter one that's slightly closer.
+* **The user never waits for the classifier.** It runs alongside the LLM and finishes after the response is sent, so even a slow classifier model adds no latency. If it fails, the answer is cached with the default policy; brief Google errors (429 / 5xx) are retried first.
+* **The cache is an optimisation, never a dependency.** If Redis or the embedding API fails, the request goes to the LLM (`X-Cache-Bypass-Reason: cache-error`). LLM errors keep their meaning: 429 and 503 pass through so clients retry.
+* **Only complete answers are cached.** An answer cut off (`length`, `content_filter`), or a stream the client abandoned, is never stored, so nobody is served half an answer.
+* **Embeddings are remembered, not answers guessed.** Re-embedding identical text returns an identical vector, so remembering it changes no result and saves quota (the load test made 420 embedding calls for 2,000 requests).
+* **Learned thresholds have guardrails.** They need 10 labels, 95% precision and 5 labels of support, never go below the lowest similarity anyone has judged, and stay within 0.90–0.99.
+* **Measured, not assumed.** The load test's workload knows which wordings are the same question, and the server logs which cached question served each hit, so wrong answers are counted exactly, not estimated.
+
+## Limitations and next steps
+
+* **Raise the classification threshold** (or label hits): at 0.90, different reviews in the same template match (above).
+* **The classifier costs tokens on every miss:** about 250 per call, on a separate model and quota. This workload's answers are deliberately short (one or two sentences), so here the classifier used more tokens than the answers did; with typical answers of several hundred tokens it's a small fraction. A shorter prompt, or reusing the classification of a near-identical cached question, would cut it.
+* **Single-turn only.** Caching multi-turn conversations needs a key that covers the history.
+* **Metrics are per process.** Running several workers needs Prometheus multiprocess mode (see the note at the end).
+* **The load test was paced for the free tier** (12 LLM calls a minute), so its duration isn't a throughput benchmark.
 
 ## Run the whole stack
 
@@ -33,7 +103,7 @@ uv run python -m loadtest.run --requests 2000 --clear-cache  # run it against an
 * **The workload** (`loadtest/workload.py`) is 159 different questions, each with several wordings. A few are asked constantly and most rarely (a Zipf "long tail"), as in real traffic. It includes creative requests, which are never cached, and time-sensitive ones, which are cached only briefly. The same `--seed` always gives the same requests.
 * **The runner** sends `--concurrency` requests at a time, no faster than `--rps` per second, and backs off and retries when the LLM is overloaded or rate-limited (429 / 502 / 503).
 * **Rate limits and quotas:** `--llm-rpm 12` keeps LLM calls under a per-minute limit, and `--llm-budget 450` stops the run cleanly before it makes more LLM calls than that (for a daily quota); the report then covers the requests completed. Only misses call the LLM, twice each (the answer and the classifier), so the run speeds up as the cache fills. Staying under the limit matters for correctness, not only speed: a rate-limited classifier falls back to the default policy.
-* **The report** (`loadtest/results/<timestamp>/report.md`) gives the hit rate and how it climbs as the cache fills, latency percentiles for hits and misses, tokens and RM saved, and **wrong answers**: hits that served an answer generated for a different question. Because the workload knows which requests are the same question, it can check every hit.
+* **The report** (`loadtest/results/<timestamp>/report.md`) gives the hit rate and how it climbs as the cache fills, latency percentiles for hits and misses, tokens and RM saved, and **wrong answers**: hits answered from a different question's cache entry. The workload knows which wordings are the same question, and after the run the load test asks the server which cached question served each hit (`GET /v1/cache/lookups/{id}`), so every hit is checked exactly.
 
 Watch the Grafana dashboard while it runs.
 
@@ -49,7 +119,7 @@ Then each miss makes one call to each model, and you can pace and cap the run:
 uv run python -m loadtest.run --requests 2000 --clear-cache --rps 1.5     --llm-rpm 12 --llm-calls-per-miss 1 --llm-budget 470
 ```
 
-The embedding memory means the 2,000 requests need only ~419 embedding calls (one per distinct wording). Run it right after your daily quota resets (midnight Pacific time) for the whole day's allowance.
+The embedding memory means the 2,000 requests need only ~419 embedding calls (one per distinct wording). Run it right after your daily quota resets (midnight Pacific time) for the whole day's allowance. This is how the [results](#results) above were measured.
 
 The classifier can also run on a **Gemma** model (`CLASSIFIER_MODEL=gemma-4-26b-a4b-it`), which has a much larger free quota. The classifier supports Gemma's plain-text replies. In testing, though, about half of Gemma's calls failed with Google `500` errors; each failure falls back to the default policy.
 

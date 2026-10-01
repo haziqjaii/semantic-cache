@@ -219,3 +219,6 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 .env
+
+# Load test output (summaries worth keeping are copied to docs/)
+loadtest/results/
