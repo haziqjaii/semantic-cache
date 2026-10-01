@@ -45,7 +45,9 @@ class Settings(BaseSettings):
 
     # ── Classifier ─────────────────────────────────────────
     classifier_model: str = "gemini-3.5-flash-lite"
-    classifier_timeout_seconds: float = 5.0
+    # The user never waits for the classifier (it finishes after the
+    # response), so this can be generous enough for slower models.
+    classifier_timeout_seconds: float = 30.0
 
     # ── Server ──────────────────────────────────────────────
     host: str = "0.0.0.0"

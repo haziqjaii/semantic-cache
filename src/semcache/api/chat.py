@@ -5,12 +5,16 @@ This is the user-facing API. Every request flows through here:
   1. Check if cacheable (Option A: single-turn only)
   2. Look up in cache (adaptive threshold via per-entry required_similarity)
   3. On HIT → return cached response instantly
-  4. On MISS → generate from LLM + classify intent CONCURRENTLY
-  5. Store response with classifier's policy (TTL + required_similarity)
+  4. On MISS → generate from LLM, and classify intent at the same time
+  5. Respond with the answer, THEN store it with the classifier's policy
+     (TTL + required_similarity)
 
-The classifier runs concurrently with the main LLM, so it adds ZERO
-user-facing latency. If the classifier fails for any reason, we fall back
-to the engine's default policy — the user never notices.
+The user never waits for the classifier: the answer is returned as soon as
+the LLM produces it, and waiting for the classifier and storing the answer
+happen after the response is sent (FastAPI background tasks). So a slow
+classifier model can't slow a request down. If the classifier fails for
+any reason, we fall back to the engine's default policy — the user never
+notices.
 
 The cache is an optimization, never a dependency: if Redis or the embedding
 API fails during lookup or store, the user still gets the LLM's answer.
@@ -35,11 +39,11 @@ import asyncio
 import logging
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import suppress
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Response
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Response
 from fastapi.responses import StreamingResponse
 
 from semcache.api.dependencies import get_classifier, get_engine, get_provider
@@ -254,9 +258,9 @@ async def _stream_generation(
     before responding, so early failures can be proper HTTP errors).
 
     When the answer is complete, `on_complete(text, finish_reason, usage)`
-    runs (it stores the answer in the cache) before the closing events are
-    sent. If the client disconnects, or the stream breaks or is cut short,
-    it never runs, so partial answers are never cached.
+    runs (it arranges for the answer to be stored once the stream ends). If
+    the client disconnects, or the stream breaks or is cut short, it never
+    runs, so partial answers are never cached.
     """
     parts: list[str] = []
     finish_reason: str | None = None
@@ -333,6 +337,9 @@ async def chat_completions(
     provider: LLMProvider = Depends(get_provider),  # noqa: B008
     classifier: IntentClassifier = Depends(get_classifier),  # noqa: B008
     x_cache_tags: Annotated[str | None, Header()] = None,
+    # FastAPI always supplies this. Direct calls (tests, scripts) may leave it
+    # out, and then the post-response work runs before returning instead.
+    background_tasks: BackgroundTasks = None,  # type: ignore[assignment]
 ) -> ChatCompletionResponse | StreamingResponse:
     """
     OpenAI-compatible chat completions endpoint with semantic caching.
@@ -354,6 +361,28 @@ async def chat_completions(
         REQUEST_DURATION.labels(cache_status=status, model=request.model).observe(
             time.time() - start_time
         )
+
+    async def after_response(job: Callable[[], Awaitable[None]]) -> None:
+        """Run `job` once the response has been sent, so the client doesn't wait for it."""
+        if background_tasks is not None:
+            background_tasks.add_task(job)
+        else:
+            await job()
+
+    def classify_and_store(
+        classify_task: asyncio.Task, text: str, finish_reason: str, usage: UsageInfo | None
+    ) -> Callable[[], Awaitable[None]]:
+        """The post-response job for a miss: wait for the classifier, then cache the answer."""
+
+        async def job() -> None:
+            classify_result = (await asyncio.gather(classify_task, return_exceptions=True))[0]
+            policy, intent = _resolve_policy(classify_result, engine)
+            await _store_answer(
+                engine, lookup_result, prompt=user_prompt, model=request.model, text=text,
+                finish_reason=finish_reason, usage=usage, policy=policy, intent=intent, tags=tags,
+            )
+
+        return job
 
     async def stream_uncached(status: str, bypass_reason: str) -> StreamingResponse:
         """Stream straight from the LLM, with no cache read or write."""
@@ -450,63 +479,44 @@ async def chat_completions(
                 x_cache_status=f"HIT (similarity: {lookup_result.similarity:.4f})",
             )
 
-        # 4. Cache MISS → Generate from LLM + Classify intent CONCURRENTLY
+        # 4. Cache MISS → generate from the LLM, classifying the question
+        # at the same time. Only the answer is awaited here: the classifier's
+        # result is needed only to store the answer, after the response.
         metrics.cache_misses += 1
         miss_headers = _cache_headers("MISS", lookup_id=lookup_result.lookup_id)
+        classify_task = asyncio.create_task(classifier.classify_safe(user_prompt))
 
         if streaming:
-            # The classifier runs while the answer streams; its result is
-            # only needed at the end, when the answer is stored.
-            classify_task = asyncio.create_task(classifier.classify_safe(user_prompt))
             try:
                 chunks, first = await _start_stream(provider, request)
             except BaseException:
                 classify_task.cancel()
                 raise
 
-            async def store_streamed(text: str, finish_reason: str, usage: UsageInfo | None) -> None:
-                classify_result = (await asyncio.gather(classify_task, return_exceptions=True))[0]
-                policy, intent = _resolve_policy(classify_result, engine)
-                await _store_answer(
-                    engine, lookup_result, prompt=user_prompt, model=request.model, text=text,
-                    finish_reason=finish_reason, usage=usage, policy=policy, intent=intent, tags=tags,
-                )
+            async def store_when_complete(text: str, finish_reason: str, usage: UsageInfo | None) -> None:
+                await after_response(classify_and_store(classify_task, text, finish_reason, usage))
 
             events = _stream_generation(
                 ChunkWriter(request.model), first, chunks, include_usage,
                 on_done=lambda: observe("miss"),
-                classify_task=classify_task, on_complete=store_streamed,
+                classify_task=classify_task, on_complete=store_when_complete,
             )
             return _sse_response(events, miss_headers)
 
-        # Run both tasks at the same time. The main generation takes 1-5s.
-        # The classifier takes ~200ms. By running them together, the classifier
-        # finishes well before the generation, adding zero wall-clock latency.
-        #
-        # return_exceptions=True ensures that if the classifier fails, it returns
-        # the exception object instead of raising — so the generation still completes.
-        gen_result, classify_result = await asyncio.gather(
-            provider.generate(request),
-            classifier.classify_safe(user_prompt),
-            return_exceptions=True,
-        )
-
-        # If the generation itself failed, that's a real error.
-        if isinstance(gen_result, Exception):
-            raise _provider_http_error(gen_result) from gen_result
-        if isinstance(gen_result, BaseException):
-            raise gen_result  # e.g. the request was cancelled
-
-        response: ChatCompletionResponse = gen_result
+        try:
+            response = await provider.generate(request)
+        except BaseException as exc:
+            classify_task.cancel()  # no answer, so nothing to classify it for
+            if isinstance(exc, Exception):
+                raise _provider_http_error(exc) from exc
+            raise  # e.g. the request was cancelled
         _record_llm_usage(response.usage)
-        policy, intent = _resolve_policy(classify_result, engine)
 
-        # 5. Store the new response with the classifier's policy
+        # 5. Store the new response with the classifier's policy, once the
+        # response is on its way.
         choice = response.choices[0]
-        await _store_answer(
-            engine, lookup_result, prompt=user_prompt, model=request.model,
-            text=choice.message.content, finish_reason=choice.finish_reason,
-            usage=response.usage, policy=policy, intent=intent, tags=tags,
+        await after_response(
+            classify_and_store(classify_task, choice.message.content, choice.finish_reason, response.usage)
         )
 
         http_response.headers.update(miss_headers)
