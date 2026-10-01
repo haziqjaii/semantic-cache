@@ -1,0 +1,13 @@
+# Grafana loads this at startup, so the dashboard has its data source ready.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus          # the dashboard's panels refer to this uid
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 5s       # matches the scrape interval

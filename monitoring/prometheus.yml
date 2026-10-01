@@ -1,0 +1,9 @@
+# Prometheus reads the app's /metrics page on a schedule and keeps the history.
+global:
+  scrape_interval: 5s      # frequent, so a short load test draws smooth charts
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: semcache
+    static_configs:
+      - targets: ["app:8000"]   # the app's service name in docker-compose.yml

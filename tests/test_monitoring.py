@@ -146,3 +146,16 @@ def test_metrics_reset_restores_every_default():
     assert metrics.cache_hits == 0
     assert metrics.cost_saved_myr == 0.0
     assert metrics.unpriced_models == set()
+
+
+def test_prometheus_exports_thresholds_in_use(client):
+    from semcache.metrics import CacheMetricsCollector
+
+    CacheMetricsCollector._thresholds = {"factual": 0.92, "how_to": 0.93}
+    try:
+        text = client.get("/metrics").text
+    finally:
+        CacheMetricsCollector._thresholds = {}
+
+    assert 'semcache_similarity_threshold{intent="factual"} 0.92' in text
+    assert 'semcache_similarity_threshold{intent="how_to"} 0.93' in text

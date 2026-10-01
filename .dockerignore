@@ -1,0 +1,13 @@
+# Keep the build context small, and secrets out of the image.
+.env
+.env.*
+!.env.example
+.git
+.venv
+.pytest_cache
+.ruff_cache
+**/__pycache__
+tests
+scratch
+loadtest/results
+monitoring

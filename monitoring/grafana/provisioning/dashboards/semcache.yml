@@ -1,0 +1,11 @@
+# Grafana loads every dashboard JSON in this folder at startup.
+apiVersion: 1
+
+providers:
+  - name: semcache
+    type: file
+    folder: ""
+    disableDeletion: true
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards
