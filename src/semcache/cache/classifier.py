@@ -21,6 +21,15 @@ WHY gemini-3.5-flash-lite?
     and since we run it concurrently with the main LLM generation on
     cache misses, it adds zero user-facing latency.
 
+GEMMA MODELS (e.g. CLASSIFIER_MODEL=gemma-4-26b-a4b-it):
+    On the free tier, Gemma has its own, much larger quota (14,400 requests
+    a day vs. 500 for flash-lite), so moving the classifier there leaves
+    flash-lite's quota for answers. Gemma on the Gemini API rejects the
+    options used for Gemini models (a separate system instruction, forced
+    JSON output, temperature: all return "500 Internal error"), so for
+    Gemma the instructions go inside the message and the plain-text reply
+    ("FACTUAL") is read by _parse_category.
+
 FAILURE HANDLING:
     The classifier MUST NEVER break the user-facing response. If it
     times out, hits a rate limit, or returns garbage, we fall back to
@@ -31,7 +40,9 @@ from __future__ import annotations
 
 import asyncio
 import enum
+import json
 import logging
+import re
 from dataclasses import dataclass
 
 from google import genai
@@ -79,6 +90,43 @@ Respond with ONLY the category name, nothing else.
 """
 
 
+# The only shape a Gemini classifier may answer with: {"category": <one of five>}.
+_CATEGORY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "category": {
+            "type": "string",
+            "enum": [c.value for c in IntentCategory],
+        }
+    },
+    "required": ["category"],
+}
+
+
+def _is_gemma(model: str) -> bool:
+    return model.startswith("gemma-")
+
+
+def _parse_category(reply: str) -> str | None:
+    """
+    The category a reply names, or None if it names none (or several).
+
+    Accepts the JSON a Gemini model is forced to give ({"category": "how_to"})
+    and the plain text a Gemma model gives ("HOW_TO", "How-to", "time sensitive").
+    """
+    text = reply.strip()
+    try:
+        value = json.loads(text)
+        if isinstance(value, dict):
+            text = str(value.get("category", ""))
+    except ValueError:
+        pass  # plain text
+
+    words = re.sub(r"[^a-z]+", " ", text.lower())  # "HOW-TO" / "how_to" → "how to"
+    named = [c.value for c in IntentCategory if re.search(rf"\b{c.value.replace('_', ' ')}\b", words)]
+    return named[0] if len(named) == 1 else None
+
+
 @dataclass
 class ClassifierResult:
     policy: CachePolicy
@@ -91,10 +139,11 @@ class ClassifierResult:
 
 class IntentClassifier:
     """
-    Classifies prompts into intent categories using gemini-3.5-flash-lite.
+    Classifies prompts into intent categories using an LLM.
 
-    Uses structured outputs (response_schema) to guarantee the LLM returns
-    exactly one valid category — no parsing, no regex, no surprises.
+    Gemini models use structured outputs (response_schema) to guarantee
+    exactly one valid category. Gemma models don't support that, so their
+    plain-text reply is parsed instead (see the module docstring).
     """
 
     def __init__(
@@ -129,40 +178,36 @@ class IntentClassifier:
             Any exception from the Gemini SDK, asyncio timeout, etc.
             Callers should use classify_safe() instead.
         """
-        response = await asyncio.wait_for(
-            self._client.aio.models.generate_content(
+        if _is_gemma(self._model):
+            # Gemma takes no system instruction, JSON mode or temperature:
+            # the instructions travel in the message itself.
+            request = self._client.aio.models.generate_content(
+                model=self._model,
+                contents=f"{_CLASSIFIER_SYSTEM_PROMPT}\nPrompt: {prompt}",
+            )
+        else:
+            request = self._client.aio.models.generate_content(
                 model=self._model,
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     system_instruction=_CLASSIFIER_SYSTEM_PROMPT,
                     temperature=0.0,  # Deterministic — we want consistent classification
-                    response_schema={
-                        "type": "object",
-                        "properties": {
-                            "category": {
-                                "type": "string",
-                                "enum": [c.value for c in IntentCategory],
-                            }
-                        },
-                        "required": ["category"],
-                    },
+                    response_schema=_CATEGORY_SCHEMA,
                     response_mime_type="application/json",
                 ),
-            ),
-            timeout=self._timeout,
-        )
+            )
+        response = await asyncio.wait_for(request, timeout=self._timeout)
 
         # Extract tokens used (safely handling None)
         tokens = (response.usage_metadata.total_token_count or 0) if response.usage_metadata else 0
 
-        # Parse the structured output.
-        import json
-
-        result = json.loads(response.text)
-        category_str = result.get("category", "factual")
+        category_str = _parse_category(response.text or "")
+        if category_str is None:
+            # Counted as a fallback by classify_safe, rather than guessing a category.
+            raise ValueError(f"Classifier reply names no single category: {response.text!r}")
 
         # Map to our predefined policies.
-        policy = TASK_POLICIES.get(category_str, self._default_policy)
+        policy = TASK_POLICIES[category_str]
 
         logger.info("Classified prompt as '%s' → TTL=%ds, threshold=%.2f (tokens: %d)",
                      category_str, policy.ttl_seconds, policy.similarity_threshold, tokens)
@@ -171,7 +216,7 @@ class IntentClassifier:
             policy=policy,
             tokens=tokens,
             is_fallback=False,
-            intent=category_str if category_str in TASK_POLICIES else None,
+            intent=category_str,
         )
 
     async def classify_safe(self, prompt: str) -> ClassifierResult:

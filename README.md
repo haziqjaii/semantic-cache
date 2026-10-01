@@ -37,6 +37,22 @@ uv run python -m loadtest.run --requests 2000 --clear-cache  # run it against an
 
 Watch the Grafana dashboard while it runs.
 
+**On the Gemini free tier**, each model has its own daily quota, so give the classifier a different model from the answers. In `.env`:
+
+```sh
+CLASSIFIER_MODEL=gemini-3.1-flash-lite   # its own 15/min, 500/day, separate from gemini-3.5-flash-lite
+```
+
+Then each miss makes one call to each model, and you can pace and cap the run:
+
+```sh
+uv run python -m loadtest.run --requests 2000 --clear-cache --rps 1.5     --llm-rpm 12 --llm-calls-per-miss 1 --llm-budget 470
+```
+
+The embedding memory means the 2,000 requests need only ~419 embedding calls (one per distinct wording). Run it right after your daily quota resets (midnight Pacific time) for the whole day's allowance.
+
+The classifier can also run on a **Gemma** model (`CLASSIFIER_MODEL=gemma-4-26b-a4b-it`), which has a much larger free quota. The classifier supports Gemma's plain-text replies. In testing, though, about half of Gemma's calls failed with Google `500` errors; each failure falls back to the default policy.
+
 ## Playground
 
 Start the server (see [Development](#development)) and open **http://localhost:8000**. The playground lets you try the cache by hand:

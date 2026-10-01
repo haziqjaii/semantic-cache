@@ -270,3 +270,89 @@ class TestAdaptiveThresholds:
         assert result2.hit
         assert result2.entry is not None
         assert result2.entry.required_similarity == 0.93  # how_to threshold
+
+
+# ── Gemma classifier (plain text, instructions in the message) ──
+
+class TestParseCategory:
+    @pytest.mark.parametrize(("reply", "category"), [
+        ('{"category": "how_to"}', "how_to"),  # Gemini's forced JSON
+        ("FACTUAL", "factual"),  # Gemma's plain text
+        ("**HOW_TO**", "how_to"),
+        ("How-to", "how_to"),
+        ("time sensitive", "time_sensitive"),
+        ("Creative.", "creative"),
+        ("classification\n", "classification"),
+    ])
+    def test_reads_each_reply_shape(self, reply, category):
+        from semcache.cache.classifier import _parse_category
+
+        assert _parse_category(reply) == category
+
+    @pytest.mark.parametrize("reply", ["banana", "", "factual or creative", '{"category": "poem"}'])
+    def test_no_single_category_is_none(self, reply):
+        from semcache.cache.classifier import _parse_category
+
+        assert _parse_category(reply) is None
+
+
+def _fake_response(text: str, tokens: int = 400):
+    from unittest.mock import MagicMock
+
+    response = MagicMock()
+    response.text = text
+    response.usage_metadata.total_token_count = tokens
+    return response
+
+
+class TestGemmaClassifier:
+    @pytest.mark.asyncio
+    async def test_gemma_gets_instructions_in_the_message_and_no_options(self):
+        """Gemma rejects system instructions, JSON mode and temperature (500 errors)."""
+        from unittest.mock import AsyncMock
+
+        from semcache.cache.classifier import _CLASSIFIER_SYSTEM_PROMPT
+
+        classifier = IntentClassifier(api_key="fake-key", model="gemma-4-26b-a4b-it")
+        call = AsyncMock(return_value=_fake_response("HOW_TO"))
+        classifier._client.aio.models.generate_content = call
+
+        result = await classifier.classify("How do I sort a list?")
+
+        kwargs = call.await_args.kwargs
+        assert kwargs["model"] == "gemma-4-26b-a4b-it"
+        assert kwargs["contents"].startswith(_CLASSIFIER_SYSTEM_PROMPT)
+        assert kwargs["contents"].endswith("Prompt: How do I sort a list?")
+        assert "config" not in kwargs
+        assert result.policy == TASK_POLICIES["how_to"]
+        assert (result.intent, result.tokens, result.is_fallback) == ("how_to", 400, False)
+
+    @pytest.mark.asyncio
+    async def test_gemini_still_uses_structured_output(self):
+        from unittest.mock import AsyncMock
+
+        classifier = IntentClassifier(api_key="fake-key", model="gemini-3.5-flash-lite")
+        call = AsyncMock(return_value=_fake_response('{"category": "factual"}'))
+        classifier._client.aio.models.generate_content = call
+
+        result = await classifier.classify("What is Python?")
+
+        config = call.await_args.kwargs["config"]
+        assert config.response_mime_type == "application/json"
+        assert config.system_instruction
+        assert result.intent == "factual"
+
+    @pytest.mark.asyncio
+    async def test_unreadable_reply_is_a_fallback_not_a_guess(self):
+        from unittest.mock import AsyncMock
+
+        classifier = IntentClassifier(api_key="fake-key", model="gemma-4-26b-a4b-it")
+        classifier._client.aio.models.generate_content = AsyncMock(
+            return_value=_fake_response("I think this might be a poem or a fact.")
+        )
+
+        result = await classifier.classify_safe("Write about the sea")
+
+        assert result.is_fallback is True
+        assert result.policy == DEFAULT_POLICY
+        assert result.intent is None
