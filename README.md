@@ -96,6 +96,7 @@ LLM failures are reported as such, not as a generic 500:
 * **`POST /v1/cache/invalidate`**: Delete cached entries by model, system prompt, or tag (see below).
 * **`GET /v1/cache/entries?limit=50`**: The most recently cached entries, newest first (admin-only, like invalidation).
 * **`POST /v1/cache/feedback`**, **`GET /v1/cache/near-misses`**, **`GET /v1/cache/tuner`**, **`GET /v1/cache/thresholds`**: threshold tuning (see below). Feedback and near misses are admin-only.
+* **`GET /v1/cache/lookups/{id}`** (admin): one lookup, by its `X-Cache-Lookup-Id`. On a hit, `candidate_prompt` is the cached question whose answer was served. The load test uses it to count wrong answers exactly.
 * **`GET /playground`** (and `/`, which redirects there): the web playground.
 
 ## Cache invalidation

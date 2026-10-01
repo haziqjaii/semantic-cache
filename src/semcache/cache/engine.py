@@ -316,6 +316,10 @@ class CacheEngine:
         await self.refresh_learned_thresholds()
         return event
 
+    async def get_lookup(self, lookup_id: str) -> LookupEvent | None:
+        """One logged lookup by id, or None (unknown, expired, or no lookup log)."""
+        return await self._lookup_log.get(lookup_id) if self._lookup_log else None
+
     async def recent_lookups(self) -> list[LookupEvent]:
         """Recent logged lookups, newest first (empty without a lookup log)."""
         return await self._lookup_log.recent() if self._lookup_log else []

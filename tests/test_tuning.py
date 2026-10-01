@@ -295,6 +295,20 @@ async def test_near_misses_endpoint(api):
 
 
 @pytest.mark.asyncio
+async def test_lookup_endpoint_says_which_cached_question_served_a_hit(api):
+    client, seed = api
+    engine = await seed([(0.97, 0.95, "factual")])
+    hit = await engine.lookup(prompt="What's Python?", model="m")
+
+    body = client.get(f"/v1/cache/lookups/{hit.lookup_id}").json()["lookup"]
+
+    assert body["prompt"] == "What's Python?"
+    assert body["outcome"] == "hit"
+    assert body["candidate_prompt"] == "cached at 0.97"
+    assert client.get("/v1/cache/lookups/nope").status_code == 404
+
+
+@pytest.mark.asyncio
 async def test_near_misses_and_feedback_need_the_admin_token(api):
     client, seed = api
     await seed([])
@@ -303,6 +317,7 @@ async def test_near_misses_and_feedback_need_the_admin_token(api):
     )
 
     assert client.get("/v1/cache/near-misses").status_code == 401
+    assert client.get("/v1/cache/lookups/x").status_code == 401  # it shows prompts
     assert client.post("/v1/cache/feedback", json={"lookup_id": "x", "good_match": True}).status_code == 401
     # The tuner and thresholds are aggregate numbers: no prompts, no side effects.
     assert client.get("/v1/cache/tuner").status_code == 200

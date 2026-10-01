@@ -166,7 +166,7 @@ async def send(
             {"role": "user", "content": request.text},
         ],
     }
-    base = {"index": request.index, "family": request.family, "kind": request.kind}
+    base = {"index": request.index, "family": request.family, "kind": request.kind, "prompt": request.text}
     error = "no attempt made"
     response: httpx.Response | None = None  # the previous attempt's response, if any
     for attempt in range(max_retries + 1):
@@ -194,6 +194,7 @@ async def send(
                 prompt_tokens=usage.get("prompt_tokens", 0),
                 completion_tokens=usage.get("completion_tokens", 0),
                 retries=attempt,
+                lookup_id=response.headers.get("x-cache-lookup-id"),
             )
         error = f"HTTP {response.status_code}: {response.text[:200]}"
         if response.status_code not in RETRY_STATUSES:
@@ -245,6 +246,28 @@ async def run(
 
     await asyncio.gather(*(worker() for _ in range(concurrency)))
     return results
+
+
+async def attach_matches(client: httpx.AsyncClient, results: list[Result], *, concurrency: int = 8) -> int:
+    """
+    Ask the server which cached question served each hit (its lookup log),
+    so the report can count wrong answers exactly. Returns how many it found.
+    """
+    hits = [r for r in results if r.status == HIT and r.lookup_id]
+    gate = asyncio.Semaphore(concurrency)
+
+    async def attach(result: Result) -> bool:
+        async with gate:
+            try:
+                response = await client.get(f"/v1/cache/lookups/{result.lookup_id}")
+            except httpx.HTTPError:
+                return False
+        if response.status_code != 200:
+            return False
+        result.matched_prompt = response.json()["lookup"]["candidate_prompt"]
+        return result.matched_prompt is not None
+
+    return sum(await asyncio.gather(*(attach(r) for r in hits)))
 
 
 def estimate(workload: dict, model: str) -> dict:
@@ -303,6 +326,9 @@ async def _main(args: argparse.Namespace) -> None:
         )
         elapsed = time.time() - started
         after = (await client.get("/v1/analytics")).json()
+        matched = await attach_matches(client, results)
+        print(f"Checked which cached question served {matched} of "
+              f"{sum(1 for r in results if r.status == HIT)} hits.")
 
     summary = summarize(results)
     saved_myr = after["savings"]["saved_myr"] - before["savings"]["saved_myr"]

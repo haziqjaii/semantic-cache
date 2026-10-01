@@ -11,9 +11,11 @@ THE NUMBERS
     tokens saved      LLM tokens the hits avoided. "Cost without the
                       cache" is spent + saved, so
                       % saved = saved / (spent + saved)
-    wrong answers     hits that returned an answer generated for a
-                      DIFFERENT question (see workload.py: families).
-                      This is the price of a threshold that's too loose.
+    wrong answers     hits answered from a DIFFERENT question's cache
+                      entry (see workload.py: families). This is the
+                      price of a threshold that's too loose. The server
+                      says which cached question served each hit (its
+                      lookup log), so this is exact, not a guess.
 """
 
 from __future__ import annotations
@@ -39,6 +41,9 @@ class Result:
     completion_tokens: int = 0
     retries: int = 0
     error: str | None = None
+    prompt: str = ""  # the question asked
+    lookup_id: str | None = None  # the X-Cache-Lookup-Id header
+    matched_prompt: str | None = None  # on a hit: the cached question whose answer was served
 
 
 def percentile(values: list[float], p: float) -> float | None:
@@ -71,25 +76,35 @@ def _hit_rate(results: list[Result]) -> float | None:
 
 def find_wrong_hits(results: list[Result]) -> tuple[list[Result], int]:
     """
-    Hits that served another family's answer, and how many hits couldn't be checked.
+    Hits answered from another family's cache entry, and how many hits couldn't be checked.
 
-    Every miss produced an answer for a known family. A hit replays one of
-    those answers word for word, so its text tells us which family it
-    really came from.
+    Each hit knows the cached question it was matched to (matched_prompt),
+    and every question asked in the run belongs to one family, so the
+    match is wrong exactly when that question's family differs.
+
+    Without matched_prompt (e.g. older results), fall back to the answer
+    text: a hit replays a miss's answer word for word, so the text tells
+    which family produced it, unless several families produced the same
+    text ("This review is negative."), when it can't be checked.
     """
-    origin: dict[str, str] = {}
+    family_of = {r.prompt: r.family for r in results if r.prompt}
+    families_by_answer: dict[str, set[str]] = {}
     for result in results:
         if result.status == MISS and result.answer:
-            origin.setdefault(result.answer, result.family)
+            families_by_answer.setdefault(result.answer, set()).add(result.family)
 
     wrong, unverified = [], 0
     for result in results:
         if result.status != HIT:
             continue
-        source = origin.get(result.answer)
-        if source is None:
-            unverified += 1  # e.g. answered from an entry cached before this run
-        elif source != result.family:
+        if result.matched_prompt is not None:
+            source = family_of.get(result.matched_prompt)
+            sources = {source} if source else set()
+        else:
+            sources = families_by_answer.get(result.answer, set())
+        if len(sources) != 1:
+            unverified += 1  # cached before this run, or the answer text is ambiguous
+        elif result.family not in sources:
             wrong.append(result)
     return wrong, unverified
 
@@ -140,7 +155,13 @@ def summarize(results: list[Result], window: int = 100) -> dict:
             "share_of_hits": len(wrong) / len(hits) if hits else None,
             "unverified_hits": unverified,
             "examples": [
-                {"asked": r.family, "similarity": r.similarity, "answer": r.answer[:120]} for r in wrong[:10]
+                {
+                    "asked": r.prompt or r.family,
+                    "matched": r.matched_prompt,
+                    "similarity": r.similarity,
+                    "answer": r.answer[:120],
+                }
+                for r in wrong[:10]
             ],
         },
     }
@@ -175,8 +196,10 @@ def render_markdown(summary: dict, *, title: str, settings: dict, saved_myr: flo
     )
     wrong_answers = (
         f"{wrong['count']} of {outcomes[HIT]} hits ({_pct(wrong['share_of_hits'])}) "
-        "served another question's answer"
+        "were answered from a different question"
     )
+    if wrong.get("unverified_hits"):
+        wrong_answers += f"; {wrong['unverified_hits']} couldn't be checked"
 
     rows = [
         ("Requests", requests),
@@ -206,7 +229,25 @@ def render_markdown(summary: dict, *, title: str, settings: dict, saved_myr: flo
     out += ["**By kind of question:**", "", "| Kind | Requests | Hit rate |", "|---|---|---|"]
     out += [f"| {kind} | {row['requests']} | {_pct(row['hit_rate'])} |" for kind, row in summary["by_kind"].items()]
     out.append("")
+
+    if wrong["examples"]:
+        out += ["**Hits answered from a different question:**", "",
+                "| Asked | Matched (cached question) | Similarity | Answer served |", "|---|---|---|---|"]
+        out += [
+            f"| {_cell(e['asked'])} | {_cell(e['matched'] or '?')} | {_similarity(e['similarity'])} | {_cell(e['answer'])} |"
+            for e in wrong["examples"]
+        ]
+        out.append("")
     return "\n".join(out)
+
+
+def _similarity(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.3f}"
+
+
+def _cell(text: str) -> str:
+    """Text that's safe inside a Markdown table cell."""
+    return " ".join(text.split()).replace("|", "\\|")
 
 
 def results_to_json(results: list[Result]) -> list[dict]:
