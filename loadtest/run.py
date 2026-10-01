@@ -253,7 +253,8 @@ def estimate(workload: dict, model: str) -> dict:
         parts = [
             estimate_cost_myr(model, llm_calls * _PROMPT_TOKENS, llm_calls * _COMPLETION_TOKENS),
             estimate_cost_myr(_CLASSIFIER_MODEL, llm_calls * _CLASSIFIER_TOKENS),
-            estimate_cost_myr(_EMBEDDING_MODEL, workload["requests"] * _EMBEDDING_TOKENS),
+            # The app remembers embeddings, so only each distinct wording costs an embedding call.
+            estimate_cost_myr(_EMBEDDING_MODEL, workload["distinct_wordings"] * _EMBEDDING_TOKENS),
         ]
         return None if None in parts else sum(parts)
 
@@ -261,6 +262,7 @@ def estimate(workload: dict, model: str) -> dict:
     high = min(workload["requests"], round(low * 1.6))  # rewordings that miss, expired entries
     return {
         "llm_calls": {"at_least": low, "likely_up_to": high},
+        "embedding_calls": workload["distinct_wordings"],
         "cost_myr": {"at_least": cost(low), "likely_up_to": cost(high)},
         "without_cache_myr": cost(workload["requests"]),
         "usd_to_myr": PRICING_TABLE["usd_to_myr"],

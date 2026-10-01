@@ -158,10 +158,8 @@ class CacheEngine:
         )
         system_prompt_hash = hash_system_prompt(system_prompt)
 
-        # Step 2: Embed the prompt.
-        # Token count is estimated (~4 chars/token); the embed API doesn't report it.
-        metrics.embedding_calls += 1
-        metrics.embedding_tokens_total += len(prompt) // 4
+        # Step 2: Embed the prompt. (Calls to the embedding API are counted
+        # by the embedder; a remembered embedding makes none.)
         embedding = await self._embedder.embed(prompt)
 
         # Step 3: Search the vector store at the FLOOR threshold.

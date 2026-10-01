@@ -109,6 +109,16 @@ Set `ADMIN_TOKEN` to require `Authorization: Bearer <token>` on this endpoint. I
 
 Entries cached before this feature have no system prompt hash or tags, so they can only be cleared by `model` or `all` (or they expire within 24 hours). When the app starts against an older index, it rebuilds the index definition automatically and keeps every cached entry.
 
+## Embedding memory
+
+Every lookup starts by embedding the question, which is a call to the Gemini Embedding API. The same text often comes back (the load test's 2,000 requests contain only 419 different wordings), and embedding it again returns exactly the same vector. So the app remembers each text's embedding in Redis (`semcache:embedding:*`, keyed by model, dimensions and exact text) and calls the API only for text it hasn't seen.
+
+* **Saves quota and time.** Repeated text makes no embedding call, which matters on the free tier (1,000 embedding calls a day), and those requests skip ~0.3 s of API latency.
+* **Changes no results.** A remembered vector is bit-for-bit the one the API would return, so hits and misses are exactly as before. Reworded questions are new text and are embedded as usual.
+* **Safe.** Different models or dimensions never share vectors; entries expire after `EMBEDDING_CACHE_TTL_SECONDS` (7 days; `0` turns the memory off; about 3 KB per text); and if Redis fails, the text is embedded by the API.
+
+`/v1/analytics` reports `embeddings.api_calls` and `embeddings.remembered`, and Prometheus `semcache_embedding_cache_hits_total`.
+
 ## Tuning thresholds: near misses, feedback, and learning
 
 How similar must two questions be to share an answer? Too loose and people get wrong answers; too strict and the cache rarely hits. The cache learns the answer from feedback:

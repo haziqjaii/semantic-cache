@@ -390,3 +390,27 @@ async def test_entry_intent_round_trip(store: RedisVectorStore):
     assert entry.intent == "how_to"
     (entry, _), = await store.search(emb, "other", threshold=0.9)
     assert entry.intent is None
+
+
+# ── Embedding memory ────────────────────────────────────────
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_embedding_memory_in_redis(store: RedisVectorStore, redis_url):
+    """Vectors come back bit-for-bit, expire, and stay out of the search index."""
+    import numpy as np
+
+    from semcache.embeddings.memory import KEY_PREFIX, RedisEmbeddingStore
+
+    memory = RedisEmbeddingStore(redis_url)
+    await memory.initialize()
+    try:
+        vector = np.random.default_rng(1).random(768, dtype=np.float32).tolist()
+        await memory.set(f"{KEY_PREFIX}abc", vector, ttl_seconds=600)
+
+        assert await memory.get(f"{KEY_PREFIX}abc") == vector
+        assert await memory.get(f"{KEY_PREFIX}missing") is None
+        assert 0 < await store._redis.ttl(f"{KEY_PREFIX}abc") <= 600
+        assert await store.count() == 0  # not a cache entry
+    finally:
+        await memory.close()

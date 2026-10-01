@@ -48,9 +48,11 @@ class CacheMetrics:
     llm_tokens_prompt: int = 0
     llm_tokens_completion: int = 0
 
-    # Embedding tracking
+    # Embedding tracking: API calls made, and texts whose embedding was
+    # remembered instead (see embeddings/memory.py).
     embedding_calls: int = 0
     embedding_tokens_total: int = 0
+    embedding_cache_hits: int = 0
 
     # What cache hits saved. Each hit saves exactly the tokens its cached
     # answer originally used, priced in MYR by that answer's model.
@@ -146,6 +148,11 @@ class CacheMetricsCollector:
         # 4. Embeddings
         yield CounterMetricFamily("semcache_embedding_calls_total", "Total embedding API calls", value=metrics.embedding_calls)
         yield CounterMetricFamily("semcache_embedding_tokens_total", "Total embedding tokens", value=metrics.embedding_tokens_total)
+        yield CounterMetricFamily(
+            "semcache_embedding_cache_hits_total",
+            "Embeddings served from memory instead of the embedding API",
+            value=metrics.embedding_cache_hits,
+        )
 
         # 5. What cache hits saved
         yield CounterMetricFamily(
