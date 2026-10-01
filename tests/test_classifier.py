@@ -356,3 +356,70 @@ class TestGemmaClassifier:
         assert result.is_fallback is True
         assert result.policy == DEFAULT_POLICY
         assert result.intent is None
+
+
+# ── Retrying brief Google errors ──
+
+class TestClassifierRetry:
+    @staticmethod
+    def _google_error(code: int) -> Exception:
+        from google.genai import errors
+
+        cls = errors.ClientError if code < 500 else errors.ServerError
+        return cls(code, {"error": {"code": code, "message": "brief", "status": "X"}})
+
+    @staticmethod
+    def _ok():
+        from semcache.cache.classifier import ClassifierResult
+
+        return ClassifierResult(policy=TASK_POLICIES["factual"], tokens=200, is_fallback=False, intent="factual")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("code", [429, 500, 503])
+    async def test_brief_errors_are_retried(self, code):
+        classifier = IntentClassifier(api_key="fake-key", retry_delays=(0, 0, 0))
+        with patch.object(
+            classifier, "classify", side_effect=[self._google_error(code), self._google_error(code), self._ok()]
+        ) as classify:
+            result = await classifier.classify_safe("What is Python?")
+
+        assert classify.call_count == 3
+        assert result.is_fallback is False
+        assert result.intent == "factual"
+
+    @pytest.mark.asyncio
+    async def test_gives_up_after_the_last_retry(self):
+        classifier = IntentClassifier(api_key="fake-key", retry_delays=(0, 0, 0))
+        with patch.object(classifier, "classify", side_effect=self._google_error(503)) as classify:
+            result = await classifier.classify_safe("What is Python?")
+
+        assert classify.call_count == 4  # the first try and three retries
+        assert result.is_fallback is True
+        assert result.policy == DEFAULT_POLICY
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("exc", [
+        TimeoutError("already waited the whole timeout"),
+        ValueError("reply names no category"),
+        "bad request",
+    ])
+    async def test_other_failures_are_not_retried(self, exc):
+        classifier = IntentClassifier(api_key="fake-key", retry_delays=(0, 0, 0))
+        if exc == "bad request":
+            exc = self._google_error(400)
+        with patch.object(classifier, "classify", side_effect=exc) as classify:
+            result = await classifier.classify_safe("What is Python?")
+
+        assert classify.call_count == 1
+        assert result.is_fallback is True
+
+    @pytest.mark.asyncio
+    async def test_waits_between_retries(self):
+        classifier = IntentClassifier(api_key="fake-key")
+        with (
+            patch.object(classifier, "classify", side_effect=[self._google_error(503), self._google_error(503), self._ok()]),
+            patch("semcache.cache.classifier.asyncio.sleep") as sleep,
+        ):
+            await classifier.classify_safe("What is Python?")
+
+        assert [c.args[0] for c in sleep.await_args_list] == [1.0, 2.0]
