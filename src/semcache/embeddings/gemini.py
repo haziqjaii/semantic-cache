@@ -27,6 +27,7 @@ import numpy as np
 from google import genai
 from google.genai import types
 
+from semcache import tracing
 from semcache.embeddings.base import Embedder
 from semcache.metrics import metrics
 
@@ -71,14 +72,17 @@ class GeminiEmbedder(Embedder):
         Embed a single text string using the async client.
         """
         _count_call([text])
-        response = await self._client.aio.models.embed_content(
-            model=self._model,
-            contents=text,
-            config=types.EmbedContentConfig(
-                output_dimensionality=self._dims,
-                task_type="SEMANTIC_SIMILARITY",
-            ),
-        )
+        # In a traced request this step appears only when the API is really
+        # called; a remembered embedding (embeddings/memory.py) never gets here.
+        with tracing.step("embedding", as_type="embedding", model=self._model, input=text):
+            response = await self._client.aio.models.embed_content(
+                model=self._model,
+                contents=text,
+                config=types.EmbedContentConfig(
+                    output_dimensionality=self._dims,
+                    task_type="SEMANTIC_SIMILARITY",
+                ),
+            )
         return self._normalize(response.embeddings[0].values)
 
     async def embed_batch(self, texts: list[str]) -> list[list[float]]:

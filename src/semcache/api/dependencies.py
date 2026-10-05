@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from semcache import tracing
 from semcache.cache.classifier import IntentClassifier
 from semcache.cache.engine import CacheEngine
 from semcache.cache.lookup_log import RedisLookupLog
@@ -21,6 +22,7 @@ from semcache.embeddings.memory import CachedEmbedder, RedisEmbeddingStore
 from semcache.metrics import CacheMetricsCollector
 from semcache.providers.base import LLMProvider
 from semcache.providers.gemini import GeminiProvider
+from semcache.providers.traced import TracedProvider
 
 logger = logging.getLogger(__name__)
 
@@ -140,8 +142,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             {intent: lt.threshold for intent, lt in learned.items()},
         )
 
-    # 4. Initialize LLM Provider
+    # Optional Langfuse tracing: on only when both keys are set.
+    tracing_on = tracing.configure(
+        settings.langfuse_public_key, settings.langfuse_secret_key, settings.langfuse_base_url
+    )
+
+    # 4. Initialize LLM Provider (recording each call on the request's trace
+    # when tracing is on)
     _provider = GeminiProvider(api_key=settings.gemini_api_key)
+    if tracing_on:
+        _provider = TracedProvider(_provider)
 
     # 5. Initialize Intent Classifier
     _classifier = IntentClassifier(
@@ -166,6 +176,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await embedding_store.close()
     await lookup_log.close()
     await store.close()
+    tracing.shutdown()  # sends any traces still waiting
 
 
 def get_engine() -> CacheEngine:

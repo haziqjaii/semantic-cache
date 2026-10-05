@@ -25,6 +25,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from semcache import tracing
 from semcache.api.admin import require_admin
 from semcache.api.dependencies import get_engine
 from semcache.cache.engine import CacheEngine
@@ -73,6 +74,11 @@ async def feedback(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # With Langfuse tracing on, the label also shows on the request's trace.
+    tracing.score(
+        event.trace_id, "good_match", request.good_match,
+        comment=f"{event.outcome}: compared with {event.candidate_prompt!r}",
+    )
     return {"lookup": _event_json(event), "learned_thresholds": engine.learned_thresholds}
 
 

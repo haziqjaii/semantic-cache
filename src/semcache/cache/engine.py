@@ -35,6 +35,7 @@ import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from semcache import tracing
 from semcache.cache.keys import build_namespace, hash_system_prompt
 from semcache.cache.lookup_log import HIT, MISS, NEAR_MISS, LookupEvent, LookupLog
 from semcache.cache.policy import (
@@ -166,12 +167,27 @@ class CacheEngine:
         # We use the most permissive threshold so we never miss a candidate
         # that some intent category would have accepted. We request top_k
         # to ensure a strict-policy near-miss doesn't shadow a loose-policy hit.
-        candidates = await self._store.search(
-            embedding=embedding,
-            namespace=namespace,
-            threshold=FLOOR_THRESHOLD,
-            top_k=5,
-        )
+        with tracing.step(
+            "vector-search", as_type="retriever",
+            input={"namespace": namespace, "search_floor": FLOOR_THRESHOLD},
+        ) as search_step:
+            candidates = await self._store.search(
+                embedding=embedding,
+                namespace=namespace,
+                threshold=FLOOR_THRESHOLD,
+                top_k=5,
+            )
+            # Every candidate and what it needed: this is what explains a
+            # hit (or a miss) when reading the trace.
+            search_step.update(output=[
+                {
+                    "cached_question": entry.prompt,
+                    "similarity": round(similarity, 4),
+                    "required": self.required_similarity(entry),
+                    "intent": entry.intent,
+                }
+                for entry, similarity in candidates
+            ])
 
         for entry, similarity in candidates:
             # Step 4: Per-entry adaptive threshold check.
@@ -264,6 +280,7 @@ class CacheEngine:
             required_similarity=required,
             intent=entry.intent if entry else None,
             candidate_prompt=entry.prompt if entry else None,
+            trace_id=tracing.current_trace_id(),
         )
         try:
             await self._lookup_log.record(event)
