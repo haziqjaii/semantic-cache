@@ -51,6 +51,9 @@ class LookupEvent:
     candidate_prompt: str | None = None
     # Feedback: does the candidate's answer fit this question? None = unlabelled.
     good_match: bool | None = None
+    # The Langfuse trace of the request, when tracing is on (see tracing.py),
+    # so feedback can be attached to that trace.
+    trace_id: str | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
@@ -106,6 +109,7 @@ def _to_hash(event: LookupEvent) -> dict[str, str]:
         "intent": opt(event.intent),
         "candidate_prompt": opt(event.candidate_prompt),
         "good_match": "" if event.good_match is None else ("1" if event.good_match else "0"),
+        "trace_id": opt(event.trace_id),
         "created_at": event.created_at.isoformat(),
     }
 
@@ -122,6 +126,7 @@ def _from_hash(event_id: str, data: dict[bytes, bytes]) -> LookupEvent:
         intent=d.get("intent") or None,
         candidate_prompt=d.get("candidate_prompt") or None,
         good_match=None if not d.get("good_match") else d["good_match"] == "1",
+        trace_id=d.get("trace_id") or None,
         created_at=datetime.fromisoformat(d["created_at"]),
     )
 

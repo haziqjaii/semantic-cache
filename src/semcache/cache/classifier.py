@@ -179,6 +179,11 @@ class IntentClassifier:
         # actually take effect.
         self._default_policy = default_policy or DEFAULT_POLICY
 
+    @property
+    def model(self) -> str:
+        """The model that classifies questions (shown on traces)."""
+        return self._model
+
     async def classify(self, prompt: str) -> ClassifierResult:
         """
         Classify a prompt and return the corresponding CachePolicy.

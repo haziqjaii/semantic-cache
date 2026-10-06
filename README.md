@@ -241,6 +241,35 @@ increase(semcache_cost_saved_myr_total[1h])
 histogram_quantile(0.95, sum by (le, cache_status) (rate(semcache_request_duration_seconds_bucket[5m])))
 ```
 
+## Tracing single requests with Langfuse (optional)
+
+Grafana shows totals. To see **one request** step by step, turn on [Langfuse](https://langfuse.com) tracing: set both keys in `.env` and restart.
+
+```bash
+LANGFUSE_PUBLIC_KEY=pk-lf-...
+LANGFUSE_SECRET_KEY=sk-lf-...
+# LANGFUSE_BASE_URL=...   # Langfuse Cloud by default; set it for another region or a self-hosted server
+```
+
+Each request then becomes a trace:
+
+```
+chat-completion            the question, the answer, and cache_status (hit / miss / bypass)
+├─ cache-lookup            hit or miss, and the lookup id
+│  ├─ embedding            only when the embedding API was called (not when the embedding was remembered)
+│  └─ vector-search        every candidate: the cached question, its similarity, and the similarity it needed
+├─ classify-intent         on a miss: the question type the classifier chose
+├─ llm-generation          on a miss or bypass: the LLM call, its tokens, and time to first word
+└─ store-answer            on a miss: whether the answer was cached, with which TTL and threshold
+```
+
+* **Why a request hit or missed** is in `vector-search`: it lists what the question was compared with and how close each candidate came.
+* **Feedback shows on the trace.** `POST /v1/cache/feedback` also adds a `good_match` score to the trace of the request it judges.
+* **Off unless both keys are set.** Without them nothing is recorded or sent, and the request path is unchanged.
+* **It can't fail a request.** Traces are sent in the background; if Langfuse is unreachable the error is logged and the request is served as usual.
+* **Privacy:** with tracing on, questions and answers are sent to the Langfuse server you configured.
+* Self-hosting Langfuse? Its default port is 3000, the same as Grafana here, so run one of them on another port.
+
 ## Development
 
 1. Start only Redis Stack (Redis plus the RediSearch module needed for vector search):

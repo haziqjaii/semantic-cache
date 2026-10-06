@@ -33,6 +33,11 @@ STREAMING ("stream": true)
     An LLM failure before the first word is a normal HTTP error (502/503).
     After that the status is already sent, so the stream ends with an
     error event instead.
+
+TRACING
+    With Langfuse keys set, each request is also recorded as a trace (see
+    tracing.py). Without them, every `trace.` and `tracing.` call below
+    does nothing.
 """
 
 import asyncio
@@ -46,6 +51,7 @@ from typing import Annotated
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Response
 from fastapi.responses import StreamingResponse
 
+from semcache import tracing
 from semcache.api.dependencies import get_classifier, get_engine, get_provider
 from semcache.api.streaming import DONE, SSE_HEADERS, SSE_MEDIA_TYPE, ChunkWriter
 from semcache.cache.classifier import ClassifierResult, IntentClassifier
@@ -171,8 +177,8 @@ async def _store_answer(
     policy: CachePolicy,
     intent: str | None,
     tags: list[str],
-) -> None:
-    """Cache a freshly generated answer, if it's fit to be served again."""
+) -> bool:
+    """Cache a freshly generated answer, if it's fit to be served again. Returns whether it was stored."""
     if finish_reason != "stop" or not text.strip():
         # Truncated, filtered, or empty generations must not be served to
         # future users. Only answers that finished normally are cached.
@@ -182,9 +188,9 @@ async def _store_answer(
             not text.strip(),
             prompt[:50],
         )
-        return
+        return False
     if lookup_result.embedding is None:
-        return
+        return False
 
     # Keep what a hit needs to replay the answer faithfully and to
     # credit the exact cost it saves.
@@ -192,7 +198,7 @@ async def _store_answer(
     if usage:
         response_metadata["usage"] = usage.model_dump()
     try:
-        await engine.store(
+        entry_id = await engine.store(
             lookup_result=lookup_result,
             prompt=prompt,
             response=text,
@@ -206,6 +212,8 @@ async def _store_answer(
         # The user already has their answer; losing one cache write is fine.
         logger.exception("Cache store failed, returning uncached response")
         metrics.cache_store_errors += 1
+        return False
+    return bool(entry_id)  # empty when the policy says not to cache (e.g. creative)
 
 
 async def _generate_uncached(
@@ -220,6 +228,60 @@ async def _generate_uncached(
         raise _provider_http_error(exc) from exc
     _record_llm_usage(response.usage)
     return response
+
+
+# ── Tracing ─────────────────────────────────────────────────
+
+def _lookup_summary(result: LookupResult) -> dict:
+    """What the cache lookup decided, for the trace."""
+    summary: dict = {"hit": result.hit, "lookup_id": result.lookup_id}
+    if result.hit and result.entry:
+        summary["similarity"] = round(result.similarity, 4)
+        summary["cached_question"] = result.entry.prompt
+    return summary
+
+
+def _end_classify_step(step: tracing.Step, task: asyncio.Task) -> None:
+    """Close the classifier's trace step when the classifier finishes."""
+    if task.cancelled():
+        step.end(level="WARNING", status_message="Cancelled: there was no answer to classify the question for.")
+        return
+    error = task.exception()
+    if error is not None:
+        step.fail(error)
+        return
+    result = task.result()
+    if not isinstance(result, ClassifierResult):
+        step.end()
+        return
+    step.end(
+        output={"intent": result.intent, "used_default_policy": result.is_fallback},
+        usage_details={"total": result.tokens} if result.tokens else None,
+        level="WARNING" if result.is_fallback else None,
+    )
+
+
+async def _close_trace_with_stream(events: AsyncIterator[str], trace: tracing.Step) -> AsyncIterator[str]:
+    """
+    Pass a stream through, making sure its trace is closed when it stops.
+
+    A stream that finishes normally has already closed its trace, and then
+    the `end` here does nothing. This catches the other cases: the client
+    disconnected, or the stream reported an error.
+    """
+    try:
+        async for event in events:
+            yield event
+    finally:
+        close = getattr(events, "aclose", None)
+        if close is not None:
+            with suppress(Exception):
+                await close()  # run the stream's own cleanup now, not at garbage collection
+        trace.end(
+            metadata={"cache_status": "error"},
+            level="WARNING",
+            status_message="The stream stopped before it finished.",
+        )
 
 
 # ── Streaming ───────────────────────────────────────────────
@@ -321,7 +383,11 @@ async def _start_stream(
         raise _provider_http_error(exc) from exc
 
 
-def _sse_response(events: AsyncIterator[str], cache_headers: dict[str, str]) -> StreamingResponse:
+def _sse_response(
+    events: AsyncIterator[str], cache_headers: dict[str, str], trace: tracing.Step
+) -> StreamingResponse:
+    if trace.open:
+        events = _close_trace_with_stream(events, trace)
     return StreamingResponse(
         events, media_type=SSE_MEDIA_TYPE, headers={**SSE_HEADERS, **cache_headers}
     )
@@ -357,10 +423,18 @@ async def chat_completions(
     streaming = bool(request.stream)
     include_usage = bool((request.stream_options or {}).get("include_usage"))
 
+    trace = tracing.start_trace(
+        "chat-completion",
+        input=[{"role": m.role, "content": m.content} for m in request.messages],
+        metadata={"model": request.model, "stream": streaming},
+    )
+
     def observe(status: str) -> None:
+        """Record the request's latency, and close its trace."""
         REQUEST_DURATION.labels(cache_status=status, model=request.model).observe(
             time.time() - start_time
         )
+        trace.end(metadata={"cache_status": status})
 
     async def after_response(job: Callable[[], Awaitable[None]]) -> None:
         """Run `job` once the response has been sent, so the client doesn't wait for it."""
@@ -373,26 +447,41 @@ async def chat_completions(
         classify_task: asyncio.Task, text: str, finish_reason: str, usage: UsageInfo | None
     ) -> Callable[[], Awaitable[None]]:
         """The post-response job for a miss: wait for the classifier, then cache the answer."""
+        # Started now, while the trace is still open; it ends when the job does.
+        store_step = trace.step("store-answer")
 
         async def job() -> None:
-            classify_result = (await asyncio.gather(classify_task, return_exceptions=True))[0]
-            policy, intent = _resolve_policy(classify_result, engine)
-            await _store_answer(
-                engine, lookup_result, prompt=user_prompt, model=request.model, text=text,
-                finish_reason=finish_reason, usage=usage, policy=policy, intent=intent, tags=tags,
-            )
+            try:
+                classify_result = (await asyncio.gather(classify_task, return_exceptions=True))[0]
+                policy, intent = _resolve_policy(classify_result, engine)
+                stored = await _store_answer(
+                    engine, lookup_result, prompt=user_prompt, model=request.model, text=text,
+                    finish_reason=finish_reason, usage=usage, policy=policy, intent=intent, tags=tags,
+                )
+                store_step.update(output={
+                    "stored": stored,
+                    "intent": intent,
+                    "ttl_seconds": policy.ttl_seconds,
+                    "required_similarity": policy.similarity_threshold,
+                })
+            finally:
+                store_step.end()
 
         return job
+
+    async def trace_answer(text: str, finish_reason: str, usage: UsageInfo | None) -> None:
+        trace.update(output=text)
 
     async def stream_uncached(status: str, bypass_reason: str) -> StreamingResponse:
         """Stream straight from the LLM, with no cache read or write."""
         metrics.classifier_calls_skipped += 1
+        trace.update(metadata={"bypass_reason": bypass_reason})
         chunks, first = await _start_stream(provider, request)
         events = _stream_generation(
             ChunkWriter(request.model), first, chunks, include_usage,
-            on_done=lambda: observe(status),
+            on_done=lambda: observe(status), on_complete=trace_answer,
         )
-        return _sse_response(events, _cache_headers("BYPASS", bypass_reason=bypass_reason))
+        return _sse_response(events, _cache_headers("BYPASS", bypass_reason=bypass_reason), trace)
 
     try:
         try:
@@ -406,6 +495,7 @@ async def chat_completions(
             if streaming:
                 return await stream_uncached("bypass", "uncacheable")
             response = await _generate_uncached(request, provider)
+            trace.update(output=response.choices[0].message.content, metadata={"bypass_reason": "uncacheable"})
             response.x_cache_status = "BYPASS (Uncacheable)"
             _set_cache_headers(http_response, "BYPASS", bypass_reason="uncacheable")
             cache_status = "bypass"
@@ -422,13 +512,15 @@ async def chat_completions(
 
         # 2. Check the Cache (uses FLOOR_THRESHOLD + per-entry required_similarity)
         try:
-            lookup_result = await engine.lookup(
-                prompt=user_prompt,
-                model=request.model,
-                system_prompt=system_prompt,
-                temperature=request.temperature,
-                max_tokens=request.max_tokens,
-            )
+            with trace.step("cache-lookup", input=user_prompt) as lookup_step:
+                lookup_result = await engine.lookup(
+                    prompt=user_prompt,
+                    model=request.model,
+                    system_prompt=system_prompt,
+                    temperature=request.temperature,
+                    max_tokens=request.max_tokens,
+                )
+                lookup_step.update(output=_lookup_summary(lookup_result))
         except Exception:
             # Embedding API or Redis is down. Serve the request without the cache.
             logger.exception("Cache lookup failed, serving uncached response")
@@ -436,6 +528,7 @@ async def chat_completions(
             if streaming:
                 return await stream_uncached("cache_error", "cache-error")
             response = await _generate_uncached(request, provider)
+            trace.update(output=response.choices[0].message.content, metadata={"bypass_reason": "cache-error"})
             response.x_cache_status = "BYPASS (Cache error)"
             _set_cache_headers(http_response, "BYPASS", bypass_reason="cache-error")
             cache_status = "cache_error"
@@ -455,13 +548,14 @@ async def chat_completions(
             metrics.cache_hits += 1
             metrics.classifier_calls_skipped += 1  # No classify needed on hit
             _record_cache_saving(entry.model, usage)
+            trace.update(output=entry.response, metadata=_lookup_summary(lookup_result))
 
             if streaming:
                 events = _stream_cached(
                     ChunkWriter(request.model, cached=True), entry.response, finish_reason,
                     usage, include_usage, on_done=lambda: observe("hit"),
                 )
-                return _sse_response(events, hit_headers)
+                return _sse_response(events, hit_headers, trace)
 
             http_response.headers.update(hit_headers)
             cache_status = "hit"
@@ -484,7 +578,14 @@ async def chat_completions(
         # result is needed only to store the answer, after the response.
         metrics.cache_misses += 1
         miss_headers = _cache_headers("MISS", lookup_id=lookup_result.lookup_id)
+        trace.update(metadata={"lookup_id": lookup_result.lookup_id})
+        classify_step = trace.step(
+            "classify-intent", as_type="generation",
+            model=getattr(classifier, "model", None), input=user_prompt,
+        )
         classify_task = asyncio.create_task(classifier.classify_safe(user_prompt))
+        if classify_step.open:
+            classify_task.add_done_callback(lambda task: _end_classify_step(classify_step, task))
 
         if streaming:
             try:
@@ -494,6 +595,7 @@ async def chat_completions(
                 raise
 
             async def store_when_complete(text: str, finish_reason: str, usage: UsageInfo | None) -> None:
+                trace.update(output=text)
                 await after_response(classify_and_store(classify_task, text, finish_reason, usage))
 
             events = _stream_generation(
@@ -501,7 +603,7 @@ async def chat_completions(
                 on_done=lambda: observe("miss"),
                 classify_task=classify_task, on_complete=store_when_complete,
             )
-            return _sse_response(events, miss_headers)
+            return _sse_response(events, miss_headers, trace)
 
         try:
             response = await provider.generate(request)
@@ -515,6 +617,7 @@ async def chat_completions(
         # 5. Store the new response with the classifier's policy, once the
         # response is on its way.
         choice = response.choices[0]
+        trace.update(output=choice.message.content)
         await after_response(
             classify_and_store(classify_task, choice.message.content, choice.finish_reason, response.usage)
         )
@@ -523,6 +626,10 @@ async def chat_completions(
         cache_status = "miss"
         return response
 
+    except BaseException as exc:
+        trace.update(metadata={"cache_status": "error"})
+        trace.fail(exc)
+        raise
     finally:
         if cache_status != "error":
             observe(cache_status)

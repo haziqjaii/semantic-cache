@@ -58,6 +58,15 @@ class Settings(BaseSettings):
     # Unset (the default) leaves it open, which is fine for local use only.
     admin_token: str | None = None
 
+    # ── Tracing (optional) ──────────────────────────────────
+    # Set both keys to record every request as a trace in Langfuse
+    # (see tracing.py). Unset (the default) leaves tracing off.
+    # With tracing on, questions and answers are sent to the Langfuse server.
+    langfuse_public_key: str | None = None
+    langfuse_secret_key: str | None = None
+    # Langfuse Cloud unless set (another region, or a self-hosted server).
+    langfuse_base_url: str | None = None
+
     model_config = SettingsConfigDict(
         env_file=".env",          # auto-load .env file from project root
         env_file_encoding="utf-8",
