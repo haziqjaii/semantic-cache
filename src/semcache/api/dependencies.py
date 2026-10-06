@@ -22,6 +22,11 @@ from semcache.embeddings.memory import CachedEmbedder, RedisEmbeddingStore
 from semcache.metrics import CacheMetricsCollector
 from semcache.providers.base import LLMProvider
 from semcache.providers.gemini import GeminiProvider
+from semcache.providers.openai_compatible import (
+    DEFAULT_BASE_URL,
+    OpenAICompatibleProvider,
+)
+from semcache.providers.router import RoutingProvider
 from semcache.providers.traced import TracedProvider
 
 logger = logging.getLogger(__name__)
@@ -150,6 +155,20 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # 4. Initialize LLM Provider (recording each call on the request's trace
     # when tracing is on)
     _provider = GeminiProvider(api_key=settings.gemini_api_key)
+    # Optional second provider: with its key set, every model that isn't
+    # Gemini's is answered by it (see providers/router.py). Embeddings and
+    # the intent classifier stay on Gemini either way.
+    openai_compatible: OpenAICompatibleProvider | None = None
+    if settings.openai_compatible_api_key:
+        openai_compatible = OpenAICompatibleProvider(
+            api_key=settings.openai_compatible_api_key,
+            base_url=settings.openai_compatible_base_url or DEFAULT_BASE_URL,
+        )
+        _provider = RoutingProvider(google=_provider, other=openai_compatible)
+        logger.info(
+            "Non-Gemini models are served by %s",
+            settings.openai_compatible_base_url or DEFAULT_BASE_URL,
+        )
     if tracing_on:
         _provider = TracedProvider(_provider)
 
@@ -176,6 +195,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await embedding_store.close()
     await lookup_log.close()
     await store.close()
+    if openai_compatible is not None:
+        await openai_compatible.close()
     tracing.shutdown()  # sends any traces still waiting
 
 

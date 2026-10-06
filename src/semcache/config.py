@@ -58,6 +58,17 @@ class Settings(BaseSettings):
     # Unset (the default) leaves it open, which is fine for local use only.
     admin_token: str | None = None
 
+    # ── A second model provider (optional) ──────────────────
+    # Any service with an OpenAI-style chat completions API: OpenAI itself,
+    # or a host serving open models (Mistral, Qwen, gpt-oss, ...) behind one
+    # address and one key. With the key set, requests for a model that isn't
+    # Gemini's go there; Gemini models, embeddings and the intent classifier
+    # still use GEMINI_API_KEY.
+    openai_compatible_api_key: str | None = None
+    # The API's address up to the version, e.g. https://host.example/v1
+    # ("/chat/completions" is added to it). OpenAI's own if unset.
+    openai_compatible_base_url: str | None = None
+
     # ── Tracing (optional) ──────────────────────────────────
     # Set both keys to record every request as a trace in Langfuse
     # (see tracing.py). Unset (the default) leaves tracing off.

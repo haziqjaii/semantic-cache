@@ -241,6 +241,28 @@ increase(semcache_cost_saved_myr_total[1h])
 histogram_quantile(0.95, sum by (le, cache_status) (rate(semcache_request_duration_seconds_bucket[5m])))
 ```
 
+## Using models from another provider (optional)
+
+Gemini is the default. To also answer with models from **any service that has an OpenAI-style API** (OpenAI itself, or a host that serves open models such as Mistral, Qwen or gpt-oss behind one address and one key), set two values in `.env` and restart:
+
+```bash
+OPENAI_COMPATIBLE_API_KEY=your-key
+OPENAI_COMPATIBLE_BASE_URL=https://host.example/v1   # the provider's "base URL"; OpenAI's own if unset
+```
+
+Then choose the model per request by its name, exactly as the provider lists it:
+
+```bash
+curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/json" \
+  -d '{"model": "openai-gpt-oss-120b", "messages": [{"role": "user", "content": "What is the capital of Malaysia?"}]}'
+```
+
+* **Routing is by model name:** names starting with `gemini` or `gemma` go to Gemini; every other name goes to the second provider. One key serves all of that provider's models.
+* **The cache works the same way** for both. The model name is part of every cache key, so one model's answer is never served for another.
+* **Embeddings and the intent classifier stay on Gemini**, so `GEMINI_API_KEY` is still required.
+* **Savings in RM need prices.** A model missing from `PRICING_TABLE` (`src/semcache/config.py`) still counts tokens saved, but its hits are listed under `savings.unpriced_models` rather than priced. Add its USD prices per million tokens to include it.
+* Thinking models' reasoning is not returned or cached, only the answer.
+
 ## Tracing single requests with Langfuse (optional)
 
 Grafana shows totals. To see **one request** step by step, turn on [Langfuse](https://langfuse.com) tracing: set both keys in `.env` and restart.
