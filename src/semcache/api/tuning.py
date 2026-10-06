@@ -31,7 +31,13 @@ from semcache.api.dependencies import get_engine
 from semcache.cache.engine import CacheEngine
 from semcache.cache.lookup_log import NEAR_MISS, LookupEvent
 from semcache.cache.policy import TASK_POLICIES
-from semcache.cache.tuning import MIN_LABELS, MIN_SUPPORT, TARGET_PRECISION, tune
+from semcache.cache.tuning import (
+    MIN_LABELS,
+    MIN_SUPPORT,
+    TARGET_PRECISION,
+    could_match,
+    tune,
+)
 
 router = APIRouter()
 
@@ -106,7 +112,7 @@ async def near_misses(
     Label them to teach thresholds: if many near misses at 0.93 are really
     the same question, the threshold for that intent is too strict.
     """
-    events = [e for e in await engine.recent_lookups() if e.outcome == NEAR_MISS]
+    events = [e for e in await engine.recent_lookups() if e.outcome == NEAR_MISS and could_match(e)]
     return {
         "total": len(events),
         "labelled": sum(1 for e in events if e.good_match is not None),

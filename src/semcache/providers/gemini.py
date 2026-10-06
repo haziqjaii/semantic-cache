@@ -9,6 +9,7 @@ from collections.abc import AsyncIterator
 from google import genai
 from google.genai import types
 
+from semcache.config import PRICING_TABLE
 from semcache.providers.base import LLMProvider, StreamChunk
 from semcache.schemas import (
     ChatCompletionChoice,
@@ -86,6 +87,14 @@ def _usage(response: types.GenerateContentResponse) -> UsageInfo | None:
 class GeminiProvider(LLMProvider):
     def __init__(self, api_key: str):
         self._client = genai.Client(api_key=api_key)
+
+    async def list_models(self) -> list[str]:
+        # The Gemini chat models we have prices for. Others still work when
+        # requested by name; give one a price to list it here.
+        return [
+            model for model in PRICING_TABLE["models"]
+            if model.startswith(("gemini", "gemma")) and "embedding" not in model
+        ]
 
     def _translate(
         self, request: ChatCompletionRequest

@@ -15,13 +15,18 @@ from semcache.cache.engine import CacheEngine
 from semcache.cache.lookup_log import RedisLookupLog
 from semcache.cache.policy import CachePolicy, TTLTier
 from semcache.cache.store.redis_store import RedisVectorStore
-from semcache.config import get_settings
+from semcache.config import add_model_prices, get_settings
 from semcache.embeddings.base import Embedder
 from semcache.embeddings.gemini import GeminiEmbedder
 from semcache.embeddings.memory import CachedEmbedder, RedisEmbeddingStore
 from semcache.metrics import CacheMetricsCollector
 from semcache.providers.base import LLMProvider
 from semcache.providers.gemini import GeminiProvider
+from semcache.providers.openai_compatible import (
+    DEFAULT_BASE_URL,
+    OpenAICompatibleProvider,
+)
+from semcache.providers.router import RoutingProvider
 from semcache.providers.traced import TracedProvider
 
 logger = logging.getLogger(__name__)
@@ -142,6 +147,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             {intent: lt.threshold for intent, lt in learned.items()},
         )
 
+    # Prices for models missing from PRICING_TABLE (EXTRA_MODEL_PRICES).
+    add_model_prices(settings.extra_model_prices)
+
     # Optional Langfuse tracing: on only when both keys are set.
     tracing_on = tracing.configure(
         settings.langfuse_public_key, settings.langfuse_secret_key, settings.langfuse_base_url
@@ -150,6 +158,22 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # 4. Initialize LLM Provider (recording each call on the request's trace
     # when tracing is on)
     _provider = GeminiProvider(api_key=settings.gemini_api_key)
+    # Optional second provider: with its key set, every model that isn't
+    # Gemini's is answered by it (see providers/router.py). Embeddings and
+    # the intent classifier stay on Gemini either way.
+    openai_compatible: OpenAICompatibleProvider | None = None
+    if settings.openai_compatible_api_key:
+        listed = settings.openai_compatible_models
+        openai_compatible = OpenAICompatibleProvider(
+            api_key=settings.openai_compatible_api_key,
+            base_url=settings.openai_compatible_base_url or DEFAULT_BASE_URL,
+            models=[m.strip() for m in listed.split(",") if m.strip()] if listed else None,
+        )
+        _provider = RoutingProvider(google=_provider, other=openai_compatible)
+        logger.info(
+            "Non-Gemini models are served by %s",
+            settings.openai_compatible_base_url or DEFAULT_BASE_URL,
+        )
     if tracing_on:
         _provider = TracedProvider(_provider)
 
@@ -176,6 +200,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await embedding_store.close()
     await lookup_log.close()
     await store.close()
+    if openai_compatible is not None:
+        await openai_compatible.close()
     tracing.shutdown()  # sends any traces still waiting
 
 

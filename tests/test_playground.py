@@ -29,7 +29,7 @@ def test_playground_calls_endpoints_that_exist():
     fetched = set(re.findall(r'fetch\(["`](/[^"`?$]+)', page))
     routes = set(app.openapi()["paths"])
 
-    assert fetched == {"/v1/chat/completions", "/v1/analytics", "/v1/cache/stats",
+    assert fetched == {"/v1/chat/completions", "/v1/models", "/v1/analytics", "/v1/cache/stats",
                        "/v1/cache/invalidate", "/v1/cache/entries", "/v1/cache/feedback",
                        "/v1/cache/near-misses", "/v1/cache/tuner", "/v1/cache/thresholds"}
     assert fetched <= routes

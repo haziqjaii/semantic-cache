@@ -41,6 +41,7 @@
   input, textarea, select { width: 100%; font: inherit; color: var(--text); background: var(--surface-2);
     border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; }
   textarea { resize: vertical; }
+  #model-other { margin-top: 6px; }
   input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
   .row { display: grid; grid-template-columns: 2fr 1fr 2fr; gap: 10px; margin-top: 10px; }
   @media (max-width: 560px) { .row { grid-template-columns: 1fr; } }
@@ -121,8 +122,12 @@
       <textarea id="question" rows="3" placeholder="What is the capital of Malaysia?"></textarea>
       <div class="row">
         <div><label for="model">Model</label>
-          <input id="model" list="models" value="gemini-3.5-flash-lite">
-          <datalist id="models"><option value="gemini-3.5-flash-lite"><option value="gemini-3.5-flash"></datalist></div>
+          <select id="model">
+            <option>gemini-3.5-flash-lite</option>
+            <option>gemini-3.5-flash</option>
+            <option value="">Other (type a name)…</option>
+          </select>
+          <input id="model-other" placeholder="Model name, exactly as the provider lists it" hidden></div>
         <div><label for="temperature">Temperature</label><input id="temperature" type="number" min="0" max="2" step="0.1" value="0.7"></div>
         <div><label for="tags">Cache tags <span class="muted">(optional)</span></label><input id="tags" placeholder="pricing, shop:v2"></div>
       </div>
@@ -275,11 +280,45 @@ async function errorText(response) {
   return `${response.status} ${response.statusText}${body ? ": " + body.slice(0, 200) : ""}`;
 }
 
+// ── Models ──────────────────────────────────────────────────
+// The dropdown lists what GET /v1/models offers. Its last option, "Other",
+// has an empty value and shows a box for typing any other model name.
+function currentModel() {
+  return $("model").value || $("model-other").value.trim() || "gemini-3.5-flash-lite";
+}
+
+function setModel(name) {
+  const select = $("model");
+  if (![...select.options].some((o) => o.value === name)) {
+    select.insertBefore(el("option", { text: name }), select.lastElementChild);
+  }
+  select.value = name;
+  $("model-other").hidden = true;
+}
+
+async function loadModels() {
+  try {
+    const response = await fetch("/v1/models");
+    if (!response.ok) return;
+    const ids = (await response.json()).data.map((m) => m.id);
+    if (!ids.length) return;
+    const select = $("model"), chosen = select.value, other = select.lastElementChild;
+    select.replaceChildren(...ids.map((id) => el("option", { text: id })), other);
+    if (chosen) setModel(chosen); else select.value = "";  // keep what was selected
+  } catch { /* keep the built-in list */ }
+}
+
+$("model").addEventListener("change", () => {
+  const typing = $("model").value === "";
+  $("model-other").hidden = !typing;
+  if (typing) $("model-other").focus();
+});
+
 // ── Ask ─────────────────────────────────────────────────────
 async function send() {
   const question = $("question").value.trim();
   if (!question) { $("question").focus(); return; }
-  const model = $("model").value.trim() || "gemini-3.5-flash-lite";
+  const model = currentModel();
   const system = $("system").value.trim();
   const messages = system ? [{ role: "system", content: system }] : [];
   messages.push({ role: "user", content: question });
@@ -417,7 +456,7 @@ function renderHistory() {
       el("td", { class: "num", text: r.similarity ?? "–" }),
       el("td", { class: "num", text: `${Math.round(r.latency)} ms` }),
     ]);
-    row.addEventListener("click", () => { $("question").value = r.question; $("model").value = r.model; $("question").focus(); });
+    row.addEventListener("click", () => { $("question").value = r.question; setModel(r.model); $("question").focus(); });
     return row;
   }));
 }
@@ -436,6 +475,7 @@ async function refreshTotals() {
       ["Hits / misses", `${c.cache_hits} / ${c.cache_misses}`],
       ["Bypassed", c.cache_bypasses + c.cache_lookup_errors],
       ["Near misses", c.cache_near_misses],
+      ["Wrong hits blocked", c.cache_number_blocks ?? 0],
       ["Cached entries", stats.total_entries ?? "–"],
       ["Tokens spent", tokens.spent.toLocaleString()],
       ["Tokens saved", tokens.saved.toLocaleString(), "good"],
@@ -601,6 +641,7 @@ $("token").addEventListener("change", () => {
   refreshNearMisses();
 });
 
+loadModels();
 refreshAll();
 setInterval(refreshTotals, 5000);
 </script>

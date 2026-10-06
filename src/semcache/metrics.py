@@ -34,6 +34,9 @@ class CacheMetrics:
     cache_misses: int = 0
     cache_bypasses: int = 0  # Uncacheable requests (multi-turn, tools)
     cache_near_misses: int = 0  # Found candidate but below required_similarity
+    # Lookups where the answer similarity alone would have served was for a
+    # question with different numbers, so it was not served (see cache/text.py).
+    cache_number_blocks: int = 0
     cache_lookup_errors: int = 0  # Lookup failed; served uncached from the LLM
     cache_store_errors: int = 0  # Store failed after a miss; response still returned
 
@@ -125,6 +128,11 @@ class CacheMetricsCollector:
         yield CounterMetricFamily("semcache_cache_misses_total", "Total cache misses", value=metrics.cache_misses)
         yield CounterMetricFamily("semcache_cache_bypasses_total", "Total cache bypasses", value=metrics.cache_bypasses)
         yield CounterMetricFamily("semcache_cache_near_misses_total", "Total cache near misses", value=metrics.cache_near_misses)
+        yield CounterMetricFamily(
+            "semcache_cache_number_blocks_total",
+            "Wrong answers avoided: the closest cached question had different numbers",
+            value=metrics.cache_number_blocks,
+        )
 
         e = CounterMetricFamily("semcache_cache_errors_total", "Total cache backend failures", labels=["stage"])
         e.add_metric(["lookup"], metrics.cache_lookup_errors)

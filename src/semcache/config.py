@@ -19,7 +19,15 @@ Why pydantic-settings?
 
 from functools import lru_cache
 
+from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class ModelPrice(BaseModel):
+    """What a model costs, in USD per million tokens."""
+
+    input: float = Field(ge=0)
+    output: float = Field(default=0.0, ge=0)
 
 
 class Settings(BaseSettings):
@@ -58,6 +66,27 @@ class Settings(BaseSettings):
     # Unset (the default) leaves it open, which is fine for local use only.
     admin_token: str | None = None
 
+    # ── A second model provider (optional) ──────────────────
+    # Any service with an OpenAI-style chat completions API: OpenAI itself,
+    # or a host serving open models (Mistral, Qwen, gpt-oss, ...) behind one
+    # address and one key. With the key set, requests for a model that isn't
+    # Gemini's go there; Gemini models, embeddings and the intent classifier
+    # still use GEMINI_API_KEY.
+    openai_compatible_api_key: str | None = None
+    # The API's address up to the version, e.g. https://host.example/v1
+    # ("/chat/completions" is added to it). OpenAI's own if unset.
+    openai_compatible_base_url: str | None = None
+    # The models to offer from that provider, comma separated. Normally
+    # unset: the list is then read from the provider itself (GET /models).
+    openai_compatible_models: str | None = None
+
+    # ── Prices for more models (optional) ───────────────────
+    # Adds to (or overrides) PRICING_TABLE below without editing code, as
+    # JSON in USD per million tokens:
+    #   EXTRA_MODEL_PRICES={"some-model": {"input": 0.15, "output": 0.60}}
+    # A model without a price still works; only its cost figures are left out.
+    extra_model_prices: dict[str, ModelPrice] = {}
+
     # ── Tracing (optional) ──────────────────────────────────
     # Set both keys to record every request as a trace in Langfuse
     # (see tracing.py). Unset (the default) leaves tracing off.
@@ -91,18 +120,36 @@ PRICING_TABLE = {
 }
 
 
-def estimate_cost_myr(model: str, input_tokens: int, output_tokens: int = 0) -> float | None:
-    """
-    Estimated cost of a call in MYR, from PRICING_TABLE's USD prices.
+def add_model_prices(prices: dict[str, ModelPrice]) -> None:
+    """Add prices to PRICING_TABLE (from EXTRA_MODEL_PRICES, at startup)."""
+    for model, price in prices.items():
+        PRICING_TABLE["models"][model] = {"input": price.input, "output": price.output}
 
-    Returns None for models missing from the table, so callers can report
-    them as unpriced instead of silently pricing them as some other model.
+
+def estimate_cost_usd(
+    model: str, input_tokens: int, output_tokens: int = 0
+) -> dict[str, float] | None:
+    """
+    Estimated cost of a call in USD, split into input, output and total.
+
+    Returns None for models missing from PRICING_TABLE, so callers can
+    report them as unpriced instead of silently pricing them as some other
+    model.
     """
     price = PRICING_TABLE["models"].get(model)
     if price is None:
         return None
-    usd = (input_tokens * price["input"] + output_tokens * price["output"]) / 1_000_000
-    return usd * PRICING_TABLE["usd_to_myr"]
+    input_cost = input_tokens * price["input"] / 1_000_000
+    output_cost = output_tokens * price["output"] / 1_000_000
+    return {"input": input_cost, "output": output_cost, "total": input_cost + output_cost}
+
+
+def estimate_cost_myr(model: str, input_tokens: int, output_tokens: int = 0) -> float | None:
+    """Estimated cost of a call in MYR (None for a model without a price)."""
+    usd = estimate_cost_usd(model, input_tokens, output_tokens)
+    if usd is None:
+        return None
+    return usd["total"] * PRICING_TABLE["usd_to_myr"]
 
 
 @lru_cache

@@ -11,6 +11,7 @@ from contextlib import suppress
 from datetime import UTC, datetime
 
 from semcache import tracing
+from semcache.config import estimate_cost_usd
 from semcache.providers.base import LLMProvider, StreamChunk
 from semcache.schemas import ChatCompletionRequest, ChatCompletionResponse, UsageInfo
 
@@ -34,9 +35,25 @@ def _usage_details(usage: UsageInfo | None) -> dict[str, int] | None:
     return {"input": usage.prompt_tokens, "output": usage.completion_tokens}
 
 
+def _cost_details(model: str, usage: UsageInfo | None) -> dict[str, float] | None:
+    """
+    The call's cost in USD, from our own price table.
+
+    Langfuse only knows prices for some model names. Sending the cost
+    ourselves shows one for every model we have a price for, and keeps
+    Langfuse's figures in line with /v1/analytics.
+    """
+    if usage is None:
+        return None
+    return estimate_cost_usd(model, usage.prompt_tokens, usage.completion_tokens)
+
+
 class TracedProvider(LLMProvider):
     def __init__(self, inner: LLMProvider) -> None:
         self._inner = inner
+
+    async def list_models(self) -> list[str]:
+        return await self._inner.list_models()
 
     async def generate(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
         with _start(request) as step:
@@ -45,6 +62,7 @@ class TracedProvider(LLMProvider):
             step.update(
                 output=choice.message.content,
                 usage_details=_usage_details(response.usage),
+                cost_details=_cost_details(request.model, response.usage),
                 metadata={"finish_reason": choice.finish_reason},
             )
             return response
@@ -80,6 +98,7 @@ class TracedProvider(LLMProvider):
             step.end(
                 output="".join(parts),
                 usage_details=_usage_details(usage),
+                cost_details=_cost_details(request.model, usage),
                 metadata={"finish_reason": finish_reason} if finish_reason else None,
                 **problem,
             )

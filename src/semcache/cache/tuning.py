@@ -34,6 +34,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 
 from semcache.cache.lookup_log import LookupEvent
+from semcache.cache.text import same_numbers
 
 # Thresholds the tuner reports and learning chooses from.
 TUNER_THRESHOLDS = [round(0.90 + i / 100, 2) for i in range(11)]  # 0.90 … 1.00
@@ -42,6 +43,18 @@ LEARNABLE_THRESHOLDS = TUNER_THRESHOLDS[:-1]  # 0.90 … 0.99
 MIN_LABELS = 10  # labels an intent needs before its threshold is learned
 MIN_SUPPORT = 5  # labels needed at or above the chosen threshold
 TARGET_PRECISION = 0.95  # at most 1 in 20 matches may be wrong
+
+
+def could_match(event: LookupEvent) -> bool:
+    """
+    True if the lookup's candidate could ever be served for its question.
+
+    A candidate whose numbers differ from the question's is never served,
+    whatever the threshold (see cache/text.py). The engine no longer logs
+    such candidates; this keeps ones logged before that from being counted
+    as would-be hits, or from teaching thresholds.
+    """
+    return event.has_candidate and same_numbers(event.prompt, event.candidate_prompt or "")
 
 
 @dataclass
@@ -67,7 +80,7 @@ def tune(events: list[LookupEvent], intent: str | None = None) -> list[TunerRow]
 
     rows = []
     for t in TUNER_THRESHOLDS:
-        hits = [e for e in events if e.has_candidate and e.similarity >= t]
+        hits = [e for e in events if could_match(e) and e.similarity >= t]
         labelled = [e for e in hits if e.good_match is not None]
         wrong = sum(1 for e in labelled if e.good_match is False)
         rows.append(TunerRow(
@@ -93,7 +106,7 @@ def learn_thresholds(labelled: list[LookupEvent]) -> dict[str, LearnedThreshold]
     """Per-intent thresholds from labelled lookups (see module docstring)."""
     by_intent: dict[str, list[LookupEvent]] = defaultdict(list)
     for event in labelled:
-        if event.intent and event.has_candidate and event.good_match is not None:
+        if event.intent and could_match(event) and event.good_match is not None:
             by_intent[event.intent].append(event)
 
     learned = {}

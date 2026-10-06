@@ -29,9 +29,9 @@ The hit rate starts at 43% (first 100 requests) and settles at 90–98% once the
 flowchart LR
     A[App, using the OpenAI API] -->|chat request| B{Single-turn?}
     B -->|no| L[LLM]
-    B -->|yes| C[Embed the question<br/>remembered per text]
+    B -->|yes| C[Clean and embed the question<br/>remembered per text]
     C --> D[Search Redis: 5 nearest cached<br/>questions in the same namespace]
-    D -->|one clears its own threshold| H[HIT: replay the cached answer]
+    D -->|one has the same numbers and<br/>clears its own threshold| H[HIT: replay the cached answer]
     D -->|none does| M[MISS: ask the LLM,<br/>return the answer at once]
     M -. after the response .-> K[Classify the question]
     K -. TTL and threshold .-> S[(Store in Redis)]
@@ -39,8 +39,8 @@ flowchart LR
 
 1. **What can be cached:** single-turn requests (one question, optional system prompt). Multi-turn conversations pass straight through (`BYPASS`).
 2. **Namespace:** model, system prompt, temperature and `max_tokens` are hashed into a namespace, and answers are only ever reused within the same one.
-3. **Embed** the question with `gemini-embedding-001`. Each text's vector is remembered in Redis, so a repeated text costs no API call.
-4. **Search** Redis's vector index (HNSW, cosine) for the 5 nearest cached questions. Each entry carries **its own required similarity**, set by the kind of question it was, and the closest entry that clears its own bar is served.
+3. **Clean, then embed** the question with `gemini-embedding-001`. For matching only, the question is lower-cased and stripped of end punctuation and polite openers ("Hi, can you tell me ..."), so wordings of one question land closer together. The LLM still gets the question exactly as asked. Each text's vector is remembered in Redis, so a repeated text costs no API call.
+4. **Search** Redis's vector index (HNSW, cosine) for the 5 nearest cached questions. Candidates whose **numbers differ** from the question's are dropped first: to an embedding, "6906006 × 2032032" and "6906006 × 2032033" are nearly the same sentence, as are "the rate in 2005" and "the rate in 2015". Then each remaining entry carries **its own required similarity**, set by the kind of question it was, and the closest entry that clears its own bar is served.
 5. **On a miss**, the LLM's answer goes straight back to the user. Only then does a classifier label the question, which sets how long the answer is kept and how similar a future question must be:
 
    | Question type | Kept for | Required similarity | Example |
@@ -62,6 +62,7 @@ The stack: **FastAPI** (Python 3.13, `uv`), **Redis Stack** (vector search via R
 * **The cache is an optimisation, never a dependency.** If Redis or the embedding API fails, the request goes to the LLM (`X-Cache-Bypass-Reason: cache-error`). LLM errors keep their meaning: 429 and 503 pass through so clients retry.
 * **Only complete answers are cached.** An answer cut off (`length`, `content_filter`), or a stream the client abandoned, is never stored, so nobody is served half an answer.
 * **Embeddings are remembered, not answers guessed.** Re-embedding identical text returns an identical vector, so remembering it changes no result and saves quota (the load test made 420 embedding calls for 2,000 requests).
+* **Similarity is not the only test.** A threshold can't separate two questions that differ by one digit (they score about 0.99), so numbers are compared exactly, by value, before similarity is considered. It costs no API call, and `cache_number_blocks` in `/v1/analytics` counts the wrong answers it stopped. Numbers written as words ("chapter three") aren't recognised; such a pair is treated as not matching, which can cost a hit but never serves a wrong answer.
 * **Learned thresholds have guardrails.** They need 10 labels, 95% precision and 5 labels of support, never go below the lowest similarity anyone has judged, and stay within 0.90–0.99.
 * **Measured, not assumed.** The load test's workload knows which wordings are the same question, and the server logs which cached question served each hit, so wrong answers are counted exactly, not estimated.
 
@@ -161,6 +162,7 @@ LLM failures are reported as such, not as a generic 500:
 ## Endpoints
 
 * **`POST /v1/chat/completions`**: OpenAI-compatible endpoint. Drops into existing applications effortlessly. Every response has an `X-Cache-Status` header (`HIT`, `MISS`, or `BYPASS`), plus `X-Cache-Similarity` on hits, `X-Cache-Bypass-Reason` (`uncacheable` or `cache-error`) on bypasses, and `X-Cache-Lookup-Id` (for feedback) on hits and misses. Cache hits replay the original answer's `usage` and `finish_reason`. Supports `"stream": true` (see [Streaming](#streaming)).
+* **`GET /v1/models`**: The models to choose from, in OpenAI's format (Gemini's, plus the second provider's when one is configured).
 * **`GET /v1/analytics`**: JSON dashboard showing hit rates, tokens spent and saved, money saved (RM), and classifier performance. (Note: metrics reset on process restart).
 * **`GET /metrics`**: Prometheus-formatted metrics (counters, request duration histograms, similarity score histograms, live cache sizes, tokens and money saved).
 * **`GET /v1/cache/stats`**: Live Redis store stats (entry count, plus Redis-wide evicted/expired key counters).
@@ -241,6 +243,35 @@ increase(semcache_cost_saved_myr_total[1h])
 histogram_quantile(0.95, sum by (le, cache_status) (rate(semcache_request_duration_seconds_bucket[5m])))
 ```
 
+## Using models from another provider (optional)
+
+Gemini is the default. To also answer with models from **any service that has an OpenAI-style API** (OpenAI itself, or a host that serves open models such as Mistral, Qwen or gpt-oss behind one address and one key), set two values in `.env` and restart:
+
+```bash
+OPENAI_COMPATIBLE_API_KEY=your-key
+OPENAI_COMPATIBLE_BASE_URL=https://host.example/v1   # the provider's "base URL"; OpenAI's own if unset
+```
+
+Then choose the model per request by its name, exactly as the provider lists it:
+
+```bash
+curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/json" \
+  -d '{"model": "openai-gpt-oss-120b", "messages": [{"role": "user", "content": "What is the capital of Malaysia?"}]}'
+```
+
+* **Routing is by model name:** names starting with `gemini` or `gemma` go to Gemini; every other name goes to the second provider. One key serves all of that provider's models.
+* **The cache works the same way** for both. The model name is part of every cache key, so one model's answer is never served for another.
+* **Embeddings and the intent classifier stay on Gemini**, so `GEMINI_API_KEY` is still required.
+* **The model list** is at `GET /v1/models` (the same shape as OpenAI's), and fills the playground's Model dropdown: the Gemini models plus the chat models the second provider reports. Any other name can still be requested; in the playground choose "Other".
+* **Cost figures need prices.** A model without a price still works and still counts tokens saved, but it has no cost in Langfuse and its hits are listed under `savings.unpriced_models` instead of being priced. Give it one in `.env`, in USD per million tokens:
+
+  ```bash
+  EXTRA_MODEL_PRICES={"openai-gpt-oss-120b": {"input": 0.15, "output": 0.60}}
+  ```
+
+  If the provider doesn't charge per token (a university or company host, say), this is a reference price you choose, such as what a commercial host charges for the same model, so say so wherever you quote the savings.
+* Thinking models' reasoning is not returned or cached, only the answer.
+
 ## Tracing single requests with Langfuse (optional)
 
 Grafana shows totals. To see **one request** step by step, turn on [Langfuse](https://langfuse.com) tracing: set both keys in `.env` and restart.
@@ -264,6 +295,7 @@ chat-completion            the question, the answer, and cache_status (hit / mis
 ```
 
 * **Why a request hit or missed** is in `vector-search`: it lists what the question was compared with and how close each candidate came.
+* **Cost shows on the LLM step** for every model that has a price here (the built-in Gemini prices, or `EXTRA_MODEL_PRICES`), in USD, so Langfuse and `/v1/analytics` agree. A cache hit has no LLM step and so no cost: that is the saving.
 * **Feedback shows on the trace.** `POST /v1/cache/feedback` also adds a `good_match` score to the trace of the request it judges.
 * **Off unless both keys are set.** Without them nothing is recorded or sent, and the request path is unchanged.
 * **It can't fail a request.** Traces are sent in the background; if Langfuse is unreachable the error is logged and the request is served as usual.

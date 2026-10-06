@@ -45,6 +45,7 @@ from semcache.cache.policy import (
     CachePolicy,
 )
 from semcache.cache.store.base import CacheEntry, EntryFilter, VectorStore
+from semcache.cache.text import clean_question, same_numbers
 from semcache.cache.tuning import LearnedThreshold, learn_thresholds
 from semcache.embeddings.base import Embedder
 from semcache.metrics import SIMILARITY_SCORE, metrics
@@ -159,9 +160,13 @@ class CacheEngine:
         )
         system_prompt_hash = hash_system_prompt(system_prompt)
 
-        # Step 2: Embed the prompt. (Calls to the embedding API are counted
-        # by the embedder; a remembered embedding makes none.)
-        embedding = await self._embedder.embed(prompt)
+        # Step 2: Embed the prompt, cleaned of capitals, punctuation and
+        # polite openers so wordings of one question land closer together
+        # (see cache/text.py). Only matching uses the cleaned text; the
+        # original is what's stored, shown, and sent to the LLM. (Calls to
+        # the embedding API are counted by the embedder; a remembered
+        # embedding makes none.)
+        embedding = await self._embedder.embed(clean_question(prompt))
 
         # Step 3: Search the vector store at the FLOOR threshold.
         # We use the most permissive threshold so we never miss a candidate
@@ -185,9 +190,15 @@ class CacheEngine:
                     "similarity": round(similarity, 4),
                     "required": self.required_similarity(entry),
                     "intent": entry.intent,
+                    "same_numbers": same_numbers(prompt, entry.prompt),
                 }
                 for entry, similarity in candidates
             ])
+
+        # Step 3b: Drop candidates whose numbers differ from the question's.
+        # Embeddings barely notice digits ("... * 2032032" vs "... * 2032033"
+        # score ~0.99), so similarity alone would serve the wrong answer.
+        candidates = self._with_same_numbers(prompt, candidates)
 
         for entry, similarity in candidates:
             # Step 4: Per-entry adaptive threshold check.
@@ -252,6 +263,31 @@ class CacheEngine:
             system_prompt_hash=system_prompt_hash,
             lookup_id=lookup_id,
         )
+
+    def _with_same_numbers(
+        self, prompt: str, candidates: list[tuple[CacheEntry, float]]
+    ) -> list[tuple[CacheEntry, float]]:
+        """
+        The candidates that contain exactly the numbers the question does.
+
+        Counts (once per lookup) when this stopped a wrong answer: the
+        candidate that similarity alone would have served had different numbers.
+        """
+        usable = []
+        picked = False  # has similarity alone chosen the answer it would serve?
+        for entry, similarity in candidates:  # best match first
+            same = same_numbers(prompt, entry.prompt)
+            if same:
+                usable.append((entry, similarity))
+            if not picked and similarity >= self.required_similarity(entry):
+                picked = True
+                if not same:
+                    metrics.cache_number_blocks += 1
+                    logger.info(
+                        "Cache hit BLOCKED (numbers differ, similarity=%.4f): %s | cached: %s",
+                        similarity, prompt[:50], entry.prompt[:50],
+                    )
+        return usable
 
     def required_similarity(self, entry: CacheEntry) -> float:
         """The similarity a query needs to reuse this entry."""
