@@ -29,18 +29,16 @@ from tests.conftest import InMemoryVectorStore, MockEmbedder
 QUERY = [1.0, 0.0]
 
 
-_DIGITS = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"]
-
-
 def _name(similarity: float) -> str:
     """
-    A cached question's text: "cached at nine-seven" for similarity 0.97.
+    A cached question's text: "cached at level j-h" for similarity 0.97.
 
-    Spelled out, because a cached answer is only reused when its question
-    has the same numbers as the one asked (cache/text.py), and the
-    questions asked in these tests have none.
+    In letters (a = 0 ... j = 9), because a cached answer is only reused
+    when its question has the same numbers as the one asked, in digits or
+    in words (cache/text.py), and the questions asked in these tests have
+    none.
     """
-    return "cached at " + "-".join(_DIGITS[int(d)] for d in f"{similarity:.2f}"[2:])
+    return "cached at level " + "-".join("abcdefghij"[int(d)] for d in f"{similarity:.2f}"[2:])
 
 
 def _vector(similarity: float) -> list[float]:
