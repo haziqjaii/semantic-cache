@@ -161,6 +161,7 @@ LLM failures are reported as such, not as a generic 500:
 ## Endpoints
 
 * **`POST /v1/chat/completions`**: OpenAI-compatible endpoint. Drops into existing applications effortlessly. Every response has an `X-Cache-Status` header (`HIT`, `MISS`, or `BYPASS`), plus `X-Cache-Similarity` on hits, `X-Cache-Bypass-Reason` (`uncacheable` or `cache-error`) on bypasses, and `X-Cache-Lookup-Id` (for feedback) on hits and misses. Cache hits replay the original answer's `usage` and `finish_reason`. Supports `"stream": true` (see [Streaming](#streaming)).
+* **`GET /v1/models`**: The models to choose from, in OpenAI's format (Gemini's, plus the second provider's when one is configured).
 * **`GET /v1/analytics`**: JSON dashboard showing hit rates, tokens spent and saved, money saved (RM), and classifier performance. (Note: metrics reset on process restart).
 * **`GET /metrics`**: Prometheus-formatted metrics (counters, request duration histograms, similarity score histograms, live cache sizes, tokens and money saved).
 * **`GET /v1/cache/stats`**: Live Redis store stats (entry count, plus Redis-wide evicted/expired key counters).
@@ -260,7 +261,14 @@ curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/jso
 * **Routing is by model name:** names starting with `gemini` or `gemma` go to Gemini; every other name goes to the second provider. One key serves all of that provider's models.
 * **The cache works the same way** for both. The model name is part of every cache key, so one model's answer is never served for another.
 * **Embeddings and the intent classifier stay on Gemini**, so `GEMINI_API_KEY` is still required.
-* **Savings in RM need prices.** A model missing from `PRICING_TABLE` (`src/semcache/config.py`) still counts tokens saved, but its hits are listed under `savings.unpriced_models` rather than priced. Add its USD prices per million tokens to include it.
+* **The model list** is at `GET /v1/models` (the same shape as OpenAI's), and fills the playground's Model dropdown: the Gemini models plus the chat models the second provider reports. Any other name can still be requested; in the playground choose "Other".
+* **Cost figures need prices.** A model without a price still works and still counts tokens saved, but it has no cost in Langfuse and its hits are listed under `savings.unpriced_models` instead of being priced. Give it one in `.env`, in USD per million tokens:
+
+  ```bash
+  EXTRA_MODEL_PRICES={"openai-gpt-oss-120b": {"input": 0.15, "output": 0.60}}
+  ```
+
+  If the provider doesn't charge per token (a university or company host, say), this is a reference price you choose, such as what a commercial host charges for the same model, so say so wherever you quote the savings.
 * Thinking models' reasoning is not returned or cached, only the answer.
 
 ## Tracing single requests with Langfuse (optional)
@@ -286,6 +294,7 @@ chat-completion            the question, the answer, and cache_status (hit / mis
 ```
 
 * **Why a request hit or missed** is in `vector-search`: it lists what the question was compared with and how close each candidate came.
+* **Cost shows on the LLM step** for every model that has a price here (the built-in Gemini prices, or `EXTRA_MODEL_PRICES`), in USD, so Langfuse and `/v1/analytics` agree. A cache hit has no LLM step and so no cost: that is the saving.
 * **Feedback shows on the trace.** `POST /v1/cache/feedback` also adds a `good_match` score to the trace of the request it judges.
 * **Off unless both keys are set.** Without them nothing is recorded or sent, and the request path is unchanged.
 * **It can't fail a request.** Traces are sent in the background; if Langfuse is unreachable the error is logged and the request is served as usual.

@@ -15,7 +15,7 @@ from semcache.cache.engine import CacheEngine
 from semcache.cache.lookup_log import RedisLookupLog
 from semcache.cache.policy import CachePolicy, TTLTier
 from semcache.cache.store.redis_store import RedisVectorStore
-from semcache.config import get_settings
+from semcache.config import add_model_prices, get_settings
 from semcache.embeddings.base import Embedder
 from semcache.embeddings.gemini import GeminiEmbedder
 from semcache.embeddings.memory import CachedEmbedder, RedisEmbeddingStore
@@ -147,6 +147,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             {intent: lt.threshold for intent, lt in learned.items()},
         )
 
+    # Prices for models missing from PRICING_TABLE (EXTRA_MODEL_PRICES).
+    add_model_prices(settings.extra_model_prices)
+
     # Optional Langfuse tracing: on only when both keys are set.
     tracing_on = tracing.configure(
         settings.langfuse_public_key, settings.langfuse_secret_key, settings.langfuse_base_url
@@ -160,9 +163,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # the intent classifier stay on Gemini either way.
     openai_compatible: OpenAICompatibleProvider | None = None
     if settings.openai_compatible_api_key:
+        listed = settings.openai_compatible_models
         openai_compatible = OpenAICompatibleProvider(
             api_key=settings.openai_compatible_api_key,
             base_url=settings.openai_compatible_base_url or DEFAULT_BASE_URL,
+            models=[m.strip() for m in listed.split(",") if m.strip()] if listed else None,
         )
         _provider = RoutingProvider(google=_provider, other=openai_compatible)
         logger.info(

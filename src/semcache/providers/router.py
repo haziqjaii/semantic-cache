@@ -34,6 +34,10 @@ class RoutingProvider(LLMProvider):
     def provider_for(self, model: str) -> LLMProvider:
         return self._google if is_google_model(model) else self._other
 
+    async def list_models(self) -> list[str]:
+        models = [*await self._google.list_models(), *await self._other.list_models()]
+        return list(dict.fromkeys(models))  # no duplicates, order kept
+
     async def generate(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
         return await self.provider_for(request.model).generate(request)
 

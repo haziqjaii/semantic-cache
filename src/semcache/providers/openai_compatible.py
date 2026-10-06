@@ -16,6 +16,7 @@ reasoning tokens are still counted, because the host bills them as output.
 """
 
 import json
+import logging
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -31,7 +32,16 @@ from semcache.schemas import (
     UsageInfo,
 )
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
+
+# How long the provider's model list is reused before asking again.
+MODEL_LIST_TTL_SECONDS = 300.0
+
+# A provider's model list also names models that can't chat. Names
+# containing one of these are left out of list_models().
+_NOT_CHAT_MODELS = ("embed", "e5-", "bge-", "rerank", "whisper", "tts")
 
 
 class ProviderHTTPError(Exception):
@@ -79,6 +89,8 @@ class OpenAICompatibleProvider(LLMProvider):
         base_url: The API's address up to and including the version, e.g.
             "https://api.openai.com/v1". "/chat/completions" is added to it.
         timeout_seconds: How long to wait for the model (per read, when streaming).
+        models: The models to offer in list_models(). Normally None: the
+            list is then read from the provider (GET <base_url>/models).
         client: A ready-made httpx client (tests pass one with a fake transport).
     """
 
@@ -87,8 +99,12 @@ class OpenAICompatibleProvider(LLMProvider):
         api_key: str,
         base_url: str = DEFAULT_BASE_URL,
         timeout_seconds: float = 120.0,
+        models: list[str] | None = None,
         client: httpx.AsyncClient | None = None,
     ) -> None:
+        self._fixed_models = models
+        self._listed_models: list[str] = []
+        self._listed_at: float | None = None
         self._client = client or httpx.AsyncClient(
             base_url=base_url.rstrip("/") + "/",
             headers={"Authorization": f"Bearer {api_key}"},
@@ -97,6 +113,31 @@ class OpenAICompatibleProvider(LLMProvider):
 
     async def close(self) -> None:
         await self._client.aclose()
+
+    async def list_models(self) -> list[str]:
+        """
+        The provider's chat models, asked for at most every few minutes.
+
+        If the provider can't be reached, the last list it gave is returned
+        (empty if there never was one): a missing list must not break anything.
+        """
+        if self._fixed_models is not None:
+            return list(self._fixed_models)
+        now = time.monotonic()
+        if self._listed_at is not None and now - self._listed_at < MODEL_LIST_TTL_SECONDS:
+            return list(self._listed_models)
+        try:
+            response = await self._client.get("models", timeout=10.0)
+            response.raise_for_status()
+            ids = [m["id"] for m in response.json().get("data") or [] if isinstance(m.get("id"), str)]
+        except Exception as exc:  # noqa: BLE001 - any failure means "no list right now"
+            logger.warning("Could not list the provider's models: %s", exc)
+            return list(self._listed_models)
+        self._listed_models = [
+            model for model in ids if not any(word in model.lower() for word in _NOT_CHAT_MODELS)
+        ]
+        self._listed_at = now
+        return list(self._listed_models)
 
     def _payload(self, request: ChatCompletionRequest, *, stream: bool) -> dict:
         payload: dict = {

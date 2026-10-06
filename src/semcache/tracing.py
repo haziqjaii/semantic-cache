@@ -52,7 +52,7 @@ _client: Any = None
 
 # Details a step accepts, passed straight to Langfuse.
 _DETAILS = frozenset({
-    "input", "output", "metadata", "model", "model_parameters", "usage_details",
+    "input", "output", "metadata", "model", "model_parameters", "usage_details", "cost_details",
     "level", "status_message", "completion_start_time",
 })
 

@@ -47,3 +47,12 @@ class LLMProvider(ABC):
         Nothing is sent to the provider until the first chunk is requested,
         so provider errors surface from the first `anext()`.
         """
+
+    async def list_models(self) -> list[str]:
+        """
+        The chat models this provider offers, for GET /v1/models.
+
+        Only a convenience for clients that show a list to pick from; any
+        model name can still be requested. Empty if the provider can't say.
+        """
+        return []
