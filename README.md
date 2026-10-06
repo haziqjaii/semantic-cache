@@ -29,9 +29,9 @@ The hit rate starts at 43% (first 100 requests) and settles at 90–98% once the
 flowchart LR
     A[App, using the OpenAI API] -->|chat request| B{Single-turn?}
     B -->|no| L[LLM]
-    B -->|yes| C[Embed the question<br/>remembered per text]
+    B -->|yes| C[Clean and embed the question<br/>remembered per text]
     C --> D[Search Redis: 5 nearest cached<br/>questions in the same namespace]
-    D -->|one clears its own threshold| H[HIT: replay the cached answer]
+    D -->|one has the same numbers and<br/>clears its own threshold| H[HIT: replay the cached answer]
     D -->|none does| M[MISS: ask the LLM,<br/>return the answer at once]
     M -. after the response .-> K[Classify the question]
     K -. TTL and threshold .-> S[(Store in Redis)]
@@ -39,8 +39,8 @@ flowchart LR
 
 1. **What can be cached:** single-turn requests (one question, optional system prompt). Multi-turn conversations pass straight through (`BYPASS`).
 2. **Namespace:** model, system prompt, temperature and `max_tokens` are hashed into a namespace, and answers are only ever reused within the same one.
-3. **Embed** the question with `gemini-embedding-001`. Each text's vector is remembered in Redis, so a repeated text costs no API call.
-4. **Search** Redis's vector index (HNSW, cosine) for the 5 nearest cached questions. Each entry carries **its own required similarity**, set by the kind of question it was, and the closest entry that clears its own bar is served.
+3. **Clean, then embed** the question with `gemini-embedding-001`. For matching only, the question is lower-cased and stripped of end punctuation and polite openers ("Hi, can you tell me ..."), so wordings of one question land closer together. The LLM still gets the question exactly as asked. Each text's vector is remembered in Redis, so a repeated text costs no API call.
+4. **Search** Redis's vector index (HNSW, cosine) for the 5 nearest cached questions. Candidates whose **numbers differ** from the question's are dropped first: to an embedding, "6906006 × 2032032" and "6906006 × 2032033" are nearly the same sentence, as are "the rate in 2005" and "the rate in 2015". Then each remaining entry carries **its own required similarity**, set by the kind of question it was, and the closest entry that clears its own bar is served.
 5. **On a miss**, the LLM's answer goes straight back to the user. Only then does a classifier label the question, which sets how long the answer is kept and how similar a future question must be:
 
    | Question type | Kept for | Required similarity | Example |
@@ -62,6 +62,7 @@ The stack: **FastAPI** (Python 3.13, `uv`), **Redis Stack** (vector search via R
 * **The cache is an optimisation, never a dependency.** If Redis or the embedding API fails, the request goes to the LLM (`X-Cache-Bypass-Reason: cache-error`). LLM errors keep their meaning: 429 and 503 pass through so clients retry.
 * **Only complete answers are cached.** An answer cut off (`length`, `content_filter`), or a stream the client abandoned, is never stored, so nobody is served half an answer.
 * **Embeddings are remembered, not answers guessed.** Re-embedding identical text returns an identical vector, so remembering it changes no result and saves quota (the load test made 420 embedding calls for 2,000 requests).
+* **Similarity is not the only test.** A threshold can't separate two questions that differ by one digit (they score about 0.99), so numbers are compared exactly, by value, before similarity is considered. It costs no API call, and `cache_number_blocks` in `/v1/analytics` counts the wrong answers it stopped. Numbers written as words ("chapter three") aren't recognised; such a pair is treated as not matching, which can cost a hit but never serves a wrong answer.
 * **Learned thresholds have guardrails.** They need 10 labels, 95% precision and 5 labels of support, never go below the lowest similarity anyone has judged, and stay within 0.90–0.99.
 * **Measured, not assumed.** The load test's workload knows which wordings are the same question, and the server logs which cached question served each hit, so wrong answers are counted exactly, not estimated.
 

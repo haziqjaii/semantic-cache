@@ -1,0 +1,302 @@
+"""
+The two text checks behind cache matching (cache/text.py): cleaning a
+question before it's embedded, and requiring the same numbers.
+"""
+
+import math
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from fastapi import Response
+
+from semcache.api.chat import chat_completions
+from semcache.cache.classifier import ClassifierResult, IntentClassifier
+from semcache.cache.engine import CacheEngine
+from semcache.cache.lookup_log import NEAR_MISS, LookupEvent
+from semcache.cache.policy import TASK_POLICIES
+from semcache.cache.store.base import CacheEntry
+from semcache.cache.text import clean_question, numbers_in, same_numbers
+from semcache.cache.tuning import MIN_LABELS, could_match, learn_thresholds, tune
+from semcache.metrics import metrics
+from semcache.providers.base import LLMProvider
+from semcache.schemas import (
+    ChatCompletionChoice,
+    ChatCompletionChoiceMessage,
+    ChatCompletionRequest,
+    ChatCompletionResponse,
+    ChatMessage,
+)
+from tests.conftest import InMemoryLookupLog, InMemoryVectorStore, MockEmbedder
+
+
+@pytest.fixture(autouse=True)
+def reset_metrics():
+    metrics.reset()
+    yield
+    metrics.reset()
+
+
+# ── Cleaning a question ─────────────────────────────────────
+
+@pytest.mark.parametrize("wording", [
+    "What is the capital of Malaysia?",
+    "what is the capital of malaysia",
+    "  What  is the\tcapital of Malaysia ??  ",
+    "WHAT IS THE CAPITAL OF MALAYSIA?",
+    "Hi, what is the capital of Malaysia?",
+    "Please, what is the capital of Malaysia",
+    "What is the capital of Malaysia, please?",
+    "what is the capital of malaysia, thanks!",
+    "Hello! Please tell me, what is the capital of Malaysia? Thank you.",
+])
+def test_wordings_of_one_question_clean_to_the_same_text(wording):
+    assert clean_question(wording) == "what is the capital of malaysia"
+
+
+@pytest.mark.parametrize(("wording", "cleaned"), [
+    ("Can you tell me what the capital of Malaysia is?", "what the capital of malaysia is"),
+    ("Could you please tell me how to sort a list?", "how to sort a list"),
+    ("Do you know who wrote Hamlet?", "who wrote hamlet"),
+    ("I want to know why the sky is blue.", "why the sky is blue"),
+    ("I'd like to know: what is osmosis?", "what is osmosis"),
+    ("May I know what time zone Malaysia uses?", "what time zone malaysia uses"),
+    ("Tolong beritahu saya apakah ibu negara Malaysia?", "apakah ibu negara malaysia"),
+    ("Boleh saya tahu apa itu fotosintesis?", "apa itu fotosintesis"),
+    ("Saya nak tahu kenapa langit biru", "kenapa langit biru"),
+])
+def test_polite_lead_ins_are_dropped(wording, cleaned):
+    assert clean_question(wording) == cleaned
+
+
+@pytest.mark.parametrize(("question", "cleaned"), [
+    # "Can you ..." on its own is the question, not a lead-in.
+    ("Can you eat raw eggs?", "can you eat raw eggs"),
+    ("Can you explain recursion?", "can you explain recursion"),
+    # Words that only look like an opener or closer.
+    ("History of the telephone", "history of the telephone"),
+    ("Hello world in Python", "hello world in python"),
+    ("Hi-fi speakers under RM 500", "hi-fi speakers under rm 500"),
+    ("Hide a file on Linux", "hide a file on linux"),
+    ("Why do people say thanks", "why do people say thanks"),
+    ("What does it mean to say please?", "what does it mean to say please"),
+    # Punctuation inside the question stays.
+    ("What does U.S.A. stand for?", "what does u.s.a. stand for"),
+    ("Is 3.5 > 3.14?", "is 3.5 > 3.14"),
+])
+def test_the_question_itself_is_left_alone(question, cleaned):
+    assert clean_question(question) == cleaned
+
+
+def test_different_questions_stay_different():
+    assert clean_question("What is the capital of Malaysia?") != clean_question("What is the capital of Indonesia?")
+
+
+@pytest.mark.parametrize("text", ["please", "Thanks!", "hi", "???", "tell me"])
+def test_cleaning_never_leaves_nothing(text):
+    assert clean_question(text)  # something is always left to embed
+
+
+def test_cleaning_twice_changes_nothing_more():
+    once = clean_question("Hey, could you tell me what DNS is? Thanks")
+    assert clean_question(once) == once == "what dns is"
+
+
+# ── Comparing numbers ───────────────────────────────────────
+
+@pytest.mark.parametrize(("question", "other"), [
+    ("What is 6906006 * 2032032?", "calculate 6906006 * 2032032"),
+    ("if there were 6906006 apple * 2032032 how many apples do i have", "whats 6906006 * 2032032"),
+    ("What is 2 + 3?", "What is 3 + 2?"),  # order doesn't matter
+    ("What is 1,000,000 in words?", "What is 1000000 in words?"),
+    ("Convert 2.50 dollars", "Convert 2.5 dollars"),
+    ("Price of 12,500 units", "Price of 12500 units"),
+    ("Half of 1,5 litres", "Half of 1.5 litres"),  # decimal comma
+    ("Top 10 films of 2005.", "the 10 best films in 2005"),
+    ("What is the capital of Malaysia?", "Which city is Malaysia's capital?"),  # no numbers at all
+])
+def test_same_numbers(question, other):
+    assert same_numbers(question, other)
+
+
+@pytest.mark.parametrize(("question", "other"), [
+    ("What is 6906006 * 2032032?", "What is 6906006 * 2032033?"),
+    ("Ringgit to US dollar in 2005", "Ringgit to US dollar in 2015"),
+    ("Value change since 1990 to 2026", "Value change in 2005"),
+    ("What is 2 + 2?", "What is 2 + 2 + 2?"),  # how often a number appears counts
+    ("Python 3.12 release notes", "Python 3.13 release notes"),
+    ("Python 3.12.1 changes", "Python 3.12.2 changes"),
+    ("What is 1.5 + 1?", "What is 15 + 1?"),
+    ("Top 10 films", "Top films"),  # one has a number, the other doesn't
+    ("Summarise chapter 3", "Summarise chapter three"),  # number words aren't recognised: no match
+])
+def test_different_numbers(question, other):
+    assert not same_numbers(question, other)
+
+
+def test_numbers_are_read_by_value():
+    found = numbers_in("In 2005 it cost 1,234.50, not 1.234,50 or 007.")
+    assert sorted(found.elements()) == [7, 1234.5, 1234.5, 2005]
+
+
+# ── In the engine ───────────────────────────────────────────
+
+def _engine(embedder=None) -> tuple[CacheEngine, InMemoryVectorStore, InMemoryLookupLog]:
+    store, log = InMemoryVectorStore(), InMemoryLookupLog()
+    return CacheEngine(embedder=embedder or MockEmbedder(), store=store, lookup_log=log), store, log
+
+
+async def _seed(engine, store, embedder, entries) -> None:
+    """Store cached questions at chosen similarities to the query vector [1, 0]."""
+    namespace = (await engine.lookup(prompt="setup", model="m")).namespace
+    for prompt, similarity in entries:
+        vector = [similarity, math.sqrt(1 - similarity**2)]
+        await store.store(vector, CacheEntry(
+            prompt=prompt, response=f"answer to: {prompt}", model="m", namespace=namespace,
+            required_similarity=0.95, intent="factual",
+        ))
+
+
+@pytest.mark.asyncio
+async def test_rewordings_hit_because_the_cleaned_question_is_embedded():
+    """MockEmbedder gives unrelated vectors to different texts, so only cleaning makes these match."""
+    engine, _, _ = _engine()
+    miss = await engine.lookup(prompt="What is the capital of Malaysia?", model="m")
+    await engine.store(miss, prompt="What is the capital of Malaysia?", response="Kuala Lumpur.", model="m")
+
+    hit = await engine.lookup(prompt="hi, please tell me what is the capital of malaysia", model="m")
+
+    assert hit.hit and hit.similarity == pytest.approx(1.0)
+    assert hit.entry.prompt == "What is the capital of Malaysia?"  # stored as it was asked
+
+
+@pytest.mark.asyncio
+async def test_a_question_with_different_numbers_is_never_served():
+    embedder = MockEmbedder(dims=2)
+    engine, store, log = _engine(embedder)
+    await _seed(engine, store, embedder, [("What is 6906006 * 2032032?", 0.99)])
+
+    with patch.object(embedder, "embed", return_value=[1.0, 0.0]):
+        result = await engine.lookup(prompt="What is 6906006 * 2032033?", model="m")
+
+    assert not result.hit  # 0.99 similar, but a different sum
+    assert metrics.cache_number_blocks == 1
+    assert metrics.cache_near_misses == 0  # and it's not a near miss to be labelled either
+    latest = (await log.recent())[0]
+    assert latest.outcome == "miss" and latest.candidate_prompt is None
+
+
+@pytest.mark.asyncio
+async def test_the_entry_with_the_right_numbers_is_served_even_if_less_similar():
+    embedder = MockEmbedder(dims=2)
+    engine, store, _ = _engine(embedder)
+    await _seed(engine, store, embedder, [
+        ("Ringgit to US dollar rate in 2015", 0.99),  # closest, wrong year
+        ("What was the ringgit to US dollar rate in 2005?", 0.96),
+    ])
+
+    with patch.object(embedder, "embed", return_value=[1.0, 0.0]):
+        result = await engine.lookup(prompt="Ringgit to US dollar rate in 2005", model="m")
+
+    assert result.hit
+    assert result.entry.prompt == "What was the ringgit to US dollar rate in 2005?"
+    assert result.similarity == pytest.approx(0.96)
+    assert metrics.cache_number_blocks == 1  # the 2015 answer would have been served
+
+
+@pytest.mark.asyncio
+async def test_same_numbers_hit_as_before_and_nothing_is_counted_as_blocked():
+    embedder = MockEmbedder(dims=2)
+    engine, store, _ = _engine(embedder)
+    await _seed(engine, store, embedder, [("whats 6906006 * 2032032", 0.97), ("What is 5 * 5?", 0.91)])
+
+    with patch.object(embedder, "embed", return_value=[1.0, 0.0]):
+        result = await engine.lookup(prompt="calculate 6906006 * 2032032", model="m")
+
+    assert result.hit and result.entry.prompt == "whats 6906006 * 2032032"
+    # The 5 * 5 entry was below its threshold anyway: dropping it prevented nothing.
+    assert metrics.cache_number_blocks == 0
+
+
+@pytest.mark.asyncio
+async def test_a_near_miss_with_the_same_numbers_is_still_logged_for_labelling():
+    embedder = MockEmbedder(dims=2)
+    engine, store, log = _engine(embedder)
+    await _seed(engine, store, embedder, [("whats 6906006 * 2032032", 0.92), ("whats 7 * 8", 0.94)])
+
+    with patch.object(embedder, "embed", return_value=[1.0, 0.0]):
+        result = await engine.lookup(
+            prompt="if there were 6906006 apple * 2032032 how many apples do i have", model="m"
+        )
+
+    assert not result.hit
+    latest = (await log.recent())[0]
+    # The closest candidate that could match, not the closer one about 7 * 8.
+    assert latest.outcome == NEAR_MISS and latest.candidate_prompt == "whats 6906006 * 2032032"
+    assert metrics.cache_number_blocks == 0  # nothing would have been served
+
+
+@pytest.mark.asyncio
+async def test_through_the_api_the_llm_gets_the_question_exactly_as_asked():
+    question = "Hi! Please tell me, What is 12 * 12?"
+    provider = MagicMock(spec=LLMProvider)
+    provider.generate = AsyncMock(side_effect=lambda request: ChatCompletionResponse(
+        id="id", created=0, model=request.model,
+        choices=[ChatCompletionChoice(message=ChatCompletionChoiceMessage(content="144"))],
+    ))
+    classifier = MagicMock(spec=IntentClassifier)
+    classifier.classify_safe = AsyncMock(return_value=ClassifierResult(
+        policy=TASK_POLICIES["factual"], tokens=5, is_fallback=False, intent="factual",
+    ))
+    engine, store, _ = _engine()
+
+    def ask(text):
+        request = ChatCompletionRequest(model="m", messages=[ChatMessage(role="user", content=text)])
+        return chat_completions(request, Response(), engine, provider, classifier)
+
+    await ask(question)
+    served = await ask("what is 12 * 12")  # the same question, plainly worded: a hit
+    await ask("what is 12 * 13")  # different numbers: the LLM is asked again
+
+    assert provider.generate.await_args_list[0].args[0].messages[0].content == question
+    assert classifier.classify_safe.await_args_list[0].args[0] == question
+    assert served.choices[0].message.content == "144"
+    assert provider.generate.await_count == 2
+    assert [entry.prompt for _, entry in store._entries] == [question, "what is 12 * 13"]
+
+
+# ── Tuning ignores pairs that can no longer match ───────────
+
+def _event(prompt, candidate, similarity, good_match=None) -> LookupEvent:
+    return LookupEvent(
+        prompt=prompt, model="m", outcome=NEAR_MISS, similarity=similarity, required_similarity=0.95,
+        intent="factual", candidate_prompt=candidate, good_match=good_match,
+    )
+
+
+def test_could_match():
+    assert could_match(_event("what is 2 * 2", "calculate 2 * 2", 0.93))
+    assert not could_match(_event("what is 2 * 2", "what is 2 * 3", 0.99))
+    assert not could_match(LookupEvent(prompt="q", model="m", outcome="miss"))  # no candidate
+
+
+def test_tuner_does_not_count_number_mismatches_as_would_be_hits():
+    events = [
+        _event("capital of Japan", "Japan's capital city", 0.96, good_match=True),
+        _event("rate in 2005", "rate in 2015", 0.99, good_match=False),  # logged before the check existed
+    ]
+
+    row = next(r for r in tune(events) if r.threshold == 0.95)
+
+    assert row.would_hit == 1 and row.wrong == 0
+
+
+def test_old_number_mismatch_labels_do_not_make_thresholds_stricter():
+    good = [_event(f"question {w}", f"the same question {w}", 0.93, good_match=True)
+            for w in "abcdefghijkl"[:MIN_LABELS]]
+    bad_numbers = [_event("rate in 2005", "rate in 2015", 0.99, good_match=False) for _ in range(5)]
+
+    learned = learn_thresholds(good + bad_numbers)
+
+    # Only the pairs that can still match teach the threshold: all good at 0.93.
+    assert learned["factual"].threshold == 0.93
+    assert learned["factual"].labels == MIN_LABELS

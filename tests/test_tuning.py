@@ -29,6 +29,20 @@ from tests.conftest import InMemoryVectorStore, MockEmbedder
 QUERY = [1.0, 0.0]
 
 
+_DIGITS = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"]
+
+
+def _name(similarity: float) -> str:
+    """
+    A cached question's text: "cached at nine-seven" for similarity 0.97.
+
+    Spelled out, because a cached answer is only reused when its question
+    has the same numbers as the one asked (cache/text.py), and the
+    questions asked in these tests have none.
+    """
+    return "cached at " + "-".join(_DIGITS[int(d)] for d in f"{similarity:.2f}"[2:])
+
+
 def _vector(similarity: float) -> list[float]:
     return [similarity, math.sqrt(1 - similarity**2)]
 
@@ -138,7 +152,7 @@ async def _engine_with(entries, lookup_log):
     lookup_log.events.clear()
     for similarity, required, intent in entries:
         entry = CacheEntry(
-            prompt=f"cached at {similarity}", response="answer", model="m", namespace=namespace,
+            prompt=_name(similarity), response="answer", model="m", namespace=namespace,
             required_similarity=required, intent=intent,
         )
         await store.store(_vector(similarity), entry)
@@ -159,7 +173,7 @@ class TestEngineLogging:
         assert event.similarity == pytest.approx(0.97)
         assert event.required_similarity == 0.95
         assert event.intent == "factual"
-        assert event.candidate_prompt == "cached at 0.97"
+        assert event.candidate_prompt == _name(0.97)
 
     @pytest.mark.asyncio
     async def test_near_miss_logs_the_closest_candidate(self, lookup_log):
@@ -289,7 +303,7 @@ async def test_near_misses_endpoint(api):
     assert body["labelled"] == 0
     (latest,) = body["near_misses"]
     assert latest["prompt"] == "Explain Python"  # newest first
-    assert latest["candidate_prompt"] == "cached at 0.93"
+    assert latest["candidate_prompt"] == _name(0.93)
     assert latest["similarity"] == pytest.approx(0.93)
     assert latest["required_similarity"] == 0.95
 
@@ -304,7 +318,7 @@ async def test_lookup_endpoint_says_which_cached_question_served_a_hit(api):
 
     assert body["prompt"] == "What's Python?"
     assert body["outcome"] == "hit"
-    assert body["candidate_prompt"] == "cached at 0.97"
+    assert body["candidate_prompt"] == _name(0.97)
     assert client.get("/v1/cache/lookups/nope").status_code == 404
 
 

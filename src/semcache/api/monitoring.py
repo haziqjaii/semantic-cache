@@ -64,6 +64,8 @@ async def get_analytics():
             "cache_misses": metrics.cache_misses,
             "cache_bypasses": metrics.cache_bypasses,
             "cache_near_misses": metrics.cache_near_misses,
+            # Wrong answers avoided because the numbers in the two questions differed.
+            "cache_number_blocks": metrics.cache_number_blocks,
             "cache_lookup_errors": metrics.cache_lookup_errors,
             "cache_store_errors": metrics.cache_store_errors,
             "hit_rate": hit_rate,

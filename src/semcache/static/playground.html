@@ -475,6 +475,7 @@ async function refreshTotals() {
       ["Hits / misses", `${c.cache_hits} / ${c.cache_misses}`],
       ["Bypassed", c.cache_bypasses + c.cache_lookup_errors],
       ["Near misses", c.cache_near_misses],
+      ["Wrong hits blocked", c.cache_number_blocks ?? 0],
       ["Cached entries", stats.total_entries ?? "–"],
       ["Tokens spent", tokens.spent.toLocaleString()],
       ["Tokens saved", tokens.saved.toLocaleString(), "good"],
