@@ -123,9 +123,7 @@ class TestCachedEmbedder:
         assert not miss.hit
         assert hit.hit
         assert hit.similarity == pytest.approx(1.0)
-        # One API call: the second lookup used the memory. The engine embeds
-        # the question cleaned for matching (cache/text.py), not as typed.
-        assert inner.calls == ["what is python"]
+        assert inner.calls == ["What is Python?"]  # the second lookup used the memory
 
 
 class TestEmbeddingApiAccounting:

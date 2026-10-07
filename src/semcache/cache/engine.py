@@ -45,7 +45,7 @@ from semcache.cache.policy import (
     CachePolicy,
 )
 from semcache.cache.store.base import CacheEntry, EntryFilter, VectorStore
-from semcache.cache.text import clean_question, same_numbers
+from semcache.cache.text import same_numbers
 from semcache.cache.tuning import LearnedThreshold, learn_thresholds
 from semcache.embeddings.base import Embedder
 from semcache.metrics import SIMILARITY_SCORE, metrics
@@ -160,13 +160,12 @@ class CacheEngine:
         )
         system_prompt_hash = hash_system_prompt(system_prompt)
 
-        # Step 2: Embed the prompt, cleaned of capitals, punctuation and
-        # polite openers so wordings of one question land closer together
-        # (see cache/text.py). Only matching uses the cleaned text; the
-        # original is what's stored, shown, and sent to the LLM. (Calls to
-        # the embedding API are counted by the embedder; a remembered
-        # embedding makes none.)
-        embedding = await self._embedder.embed(clean_question(prompt))
+        # Step 2: Embed the prompt exactly as it was asked. (Calls to the
+        # embedding API are counted by the embedder; a remembered embedding
+        # makes none.) Cleaning the text first (lower case, no polite
+        # openers) was tried and measured: it lowered similarity between
+        # wordings and cost hits. See docs/loadtest-2026-10-06.md.
+        embedding = await self._embedder.embed(prompt)
 
         # Step 3: Search the vector store at the FLOOR threshold.
         # We use the most permissive threshold so we never miss a candidate

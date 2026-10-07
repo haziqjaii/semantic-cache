@@ -1,6 +1,6 @@
 """
-The two text checks behind cache matching (cache/text.py): cleaning a
-question before it's embedded, and requiring the same numbers.
+The number check behind cache matching (cache/text.py): a cached answer is
+reused only when its question has the same numbers as the one asked.
 """
 
 import math
@@ -15,7 +15,7 @@ from semcache.cache.engine import CacheEngine
 from semcache.cache.lookup_log import NEAR_MISS, LookupEvent
 from semcache.cache.policy import TASK_POLICIES
 from semcache.cache.store.base import CacheEntry
-from semcache.cache.text import clean_question, numbers_in, same_numbers
+from semcache.cache.text import numbers_in, same_numbers
 from semcache.cache.tuning import MIN_LABELS, could_match, learn_thresholds, tune
 from semcache.metrics import metrics
 from semcache.providers.base import LLMProvider
@@ -36,71 +36,6 @@ def reset_metrics():
     metrics.reset()
 
 
-# ── Cleaning a question ─────────────────────────────────────
-
-@pytest.mark.parametrize("wording", [
-    "What is the capital of Malaysia?",
-    "what is the capital of malaysia",
-    "  What  is the\tcapital of Malaysia ??  ",
-    "WHAT IS THE CAPITAL OF MALAYSIA?",
-    "Hi, what is the capital of Malaysia?",
-    "Please, what is the capital of Malaysia",
-    "What is the capital of Malaysia, please?",
-    "what is the capital of malaysia, thanks!",
-    "Hello! Please tell me, what is the capital of Malaysia? Thank you.",
-])
-def test_wordings_of_one_question_clean_to_the_same_text(wording):
-    assert clean_question(wording) == "what is the capital of malaysia"
-
-
-@pytest.mark.parametrize(("wording", "cleaned"), [
-    ("Can you tell me what the capital of Malaysia is?", "what the capital of malaysia is"),
-    ("Could you please tell me how to sort a list?", "how to sort a list"),
-    ("Do you know who wrote Hamlet?", "who wrote hamlet"),
-    ("I want to know why the sky is blue.", "why the sky is blue"),
-    ("I'd like to know: what is osmosis?", "what is osmosis"),
-    ("May I know what time zone Malaysia uses?", "what time zone malaysia uses"),
-    ("Tolong beritahu saya apakah ibu negara Malaysia?", "apakah ibu negara malaysia"),
-    ("Boleh saya tahu apa itu fotosintesis?", "apa itu fotosintesis"),
-    ("Saya nak tahu kenapa langit biru", "kenapa langit biru"),
-])
-def test_polite_lead_ins_are_dropped(wording, cleaned):
-    assert clean_question(wording) == cleaned
-
-
-@pytest.mark.parametrize(("question", "cleaned"), [
-    # "Can you ..." on its own is the question, not a lead-in.
-    ("Can you eat raw eggs?", "can you eat raw eggs"),
-    ("Can you explain recursion?", "can you explain recursion"),
-    # Words that only look like an opener or closer.
-    ("History of the telephone", "history of the telephone"),
-    ("Hello world in Python", "hello world in python"),
-    ("Hi-fi speakers under RM 500", "hi-fi speakers under rm 500"),
-    ("Hide a file on Linux", "hide a file on linux"),
-    ("Why do people say thanks", "why do people say thanks"),
-    ("What does it mean to say please?", "what does it mean to say please"),
-    # Punctuation inside the question stays.
-    ("What does U.S.A. stand for?", "what does u.s.a. stand for"),
-    ("Is 3.5 > 3.14?", "is 3.5 > 3.14"),
-])
-def test_the_question_itself_is_left_alone(question, cleaned):
-    assert clean_question(question) == cleaned
-
-
-def test_different_questions_stay_different():
-    assert clean_question("What is the capital of Malaysia?") != clean_question("What is the capital of Indonesia?")
-
-
-@pytest.mark.parametrize("text", ["please", "Thanks!", "hi", "???", "tell me"])
-def test_cleaning_never_leaves_nothing(text):
-    assert clean_question(text)  # something is always left to embed
-
-
-def test_cleaning_twice_changes_nothing_more():
-    once = clean_question("Hey, could you tell me what DNS is? Thanks")
-    assert clean_question(once) == once == "what dns is"
-
-
 # ── Comparing numbers ───────────────────────────────────────
 
 @pytest.mark.parametrize(("question", "other"), [
@@ -113,6 +48,25 @@ def test_cleaning_twice_changes_nothing_more():
     ("Half of 1,5 litres", "Half of 1.5 litres"),  # decimal comma
     ("Top 10 films of 2005.", "the 10 best films in 2005"),
     ("What is the capital of Malaysia?", "Which city is Malaysia's capital?"),  # no numbers at all
+    # Numbers written as words
+    ("what's fifteen percent of 200?", "What is 15% of 200?"),
+    ("Summarise chapter 3", "Summarise chapter three"),
+    ("What is twenty-five times four?", "what is 25 * 4"),
+    ("a loan of two thousand five hundred", "a loan of 2,500"),
+    ("one hundred and five divided by 5", "105 / 5"),
+    ("population of 5 million", "population of 5,000,000"),
+    ("cost of 1.5 million units", "cost of 1500000 units"),
+    ("Explain two-factor authentication", "Explain 2-factor authentication"),
+    # ... and in Malay
+    ("berapa lima belas peratus daripada 200", "berapa 15% daripada 200"),
+    ("dua puluh lima darab empat", "25 darab 4"),
+    ("pinjaman dua ribu seratus ringgit", "pinjaman 2100 ringgit"),
+    ("seribu sembilan ratus sembilan puluh", "1990"),
+    ("gaji 15 ribu", "gaji 15000"),
+    ("fifteen percent of 200", "lima belas peratus daripada 200"),  # across the two languages
+    # "one" / "satu" alone is usually not a count
+    ("Which one is bigger, 5 or 7?", "Which is bigger, 5 or 7?"),
+    ("Apakah salah satu sebab banjir?", "Apakah sebab banjir?"),
 ])
 def test_same_numbers(question, other):
     assert same_numbers(question, other)
@@ -127,7 +81,15 @@ def test_same_numbers(question, other):
     ("Python 3.12.1 changes", "Python 3.12.2 changes"),
     ("What is 1.5 + 1?", "What is 15 + 1?"),
     ("Top 10 films", "Top films"),  # one has a number, the other doesn't
-    ("Summarise chapter 3", "Summarise chapter three"),  # number words aren't recognised: no match
+    # Numbers written as words
+    ("What is fifty percent of 200?", "What is fifteen percent of 200?"),
+    ("What is 50% of 200?", "what's fifteen percent of 200?"),
+    ("What is two plus two?", "What is two plus three?"),
+    ("loan of two thousand", "loan of two hundred"),
+    ("dua puluh lima darab empat", "dua puluh enam darab empat"),
+    ("Is it between one hundred and two hundred?", "Is it between 102 and 100?"),  # "and" between two numbers
+    ("100 and 5", "105"),  # digits are never joined by "and"
+    ("Summarise chapter 3", "Summarise the third chapter"),  # ordinals aren't recognised: no match
 ])
 def test_different_numbers(question, other):
     assert not same_numbers(question, other)
@@ -136,6 +98,29 @@ def test_different_numbers(question, other):
 def test_numbers_are_read_by_value():
     found = numbers_in("In 2005 it cost 1,234.50, not 1.234,50 or 007.")
     assert sorted(found.elements()) == [7, 1234.5, 1234.5, 2005]
+
+
+@pytest.mark.parametrize(("text", "numbers"), [
+    ("twenty one", [21]),
+    ("ninety-nine", [99]),
+    ("one, two, three", [2, 3]),  # a lone "one" isn't counted
+    ("two three", [2, 3]),  # not a number together: two numbers
+    ("ten five", [5, 10]),
+    ("fifteen hundred", [1500]),
+    ("a hundred percent", [100]),
+    ("one hundred and one", [101]),
+    ("one million two hundred thousand and five", [1200005]),
+    ("three hundred thousand", [300000]),
+    ("hundreds of thousands of people", []),  # plurals are not numbers
+    ("someone, anyone, no one", []),
+    ("sebelas, sepuluh ribu, tiga juta", [11, 10000, 3000000]),
+    ("seratus dua puluh tiga", [123]),
+    ("dua ratus lima belas", [215]),
+    ("7-Eleven", [7, 11]),
+    ("FIFTEEN", [15]),
+])
+def test_number_words_are_read_by_value(text, numbers):
+    assert sorted(numbers_in(text).elements()) == numbers
 
 
 # ── In the engine ───────────────────────────────────────────
@@ -157,16 +142,15 @@ async def _seed(engine, store, embedder, entries) -> None:
 
 
 @pytest.mark.asyncio
-async def test_rewordings_hit_because_the_cleaned_question_is_embedded():
-    """MockEmbedder gives unrelated vectors to different texts, so only cleaning makes these match."""
-    engine, _, _ = _engine()
-    miss = await engine.lookup(prompt="What is the capital of Malaysia?", model="m")
-    await engine.store(miss, prompt="What is the capital of Malaysia?", response="Kuala Lumpur.", model="m")
+async def test_the_question_is_embedded_exactly_as_asked():
+    """Cleaning it first was measured to cost hits (docs/loadtest-2026-10-06.md)."""
+    embedder = MockEmbedder()
+    engine, _, _ = _engine(embedder)
 
-    hit = await engine.lookup(prompt="hi, please tell me what is the capital of malaysia", model="m")
+    with patch.object(embedder, "embed", wraps=embedder.embed) as embed:
+        await engine.lookup(prompt="Hi, please tell me the capital of Malaysia?", model="m")
 
-    assert hit.hit and hit.similarity == pytest.approx(1.0)
-    assert hit.entry.prompt == "What is the capital of Malaysia?"  # stored as it was asked
+    embed.assert_awaited_once_with("Hi, please tell me the capital of Malaysia?")
 
 
 @pytest.mark.asyncio
@@ -183,6 +167,19 @@ async def test_a_question_with_different_numbers_is_never_served():
     assert metrics.cache_near_misses == 0  # and it's not a near miss to be labelled either
     latest = (await log.recent())[0]
     assert latest.outcome == "miss" and latest.candidate_prompt is None
+
+
+@pytest.mark.asyncio
+async def test_a_number_written_as_a_word_still_hits():
+    embedder = MockEmbedder(dims=2)
+    engine, store, _ = _engine(embedder)
+    await _seed(engine, store, embedder, [("What is 50% of 200?", 0.98), ("What is 15% of 200?", 0.96)])
+
+    with patch.object(embedder, "embed", return_value=[1.0, 0.0]):
+        result = await engine.lookup(prompt="what's fifteen percent of 200?", model="m")
+
+    assert result.hit and result.entry.prompt == "What is 15% of 200?"
+    assert metrics.cache_number_blocks == 1  # the 50% answer would have been served
 
 
 @pytest.mark.asyncio
@@ -254,8 +251,8 @@ async def test_through_the_api_the_llm_gets_the_question_exactly_as_asked():
         return chat_completions(request, Response(), engine, provider, classifier)
 
     await ask(question)
-    served = await ask("what is 12 * 12")  # the same question, plainly worded: a hit
-    await ask("what is 12 * 13")  # different numbers: the LLM is asked again
+    served = await ask(question)  # asked again: a hit
+    await ask("what is 12 * 13")  # a different question: the LLM is asked again
 
     assert provider.generate.await_args_list[0].args[0].messages[0].content == question
     assert classifier.classify_safe.await_args_list[0].args[0] == question
