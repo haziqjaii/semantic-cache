@@ -262,7 +262,8 @@ curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/jso
 
 * **Routing is by model name:** names starting with `gemini` or `gemma` go to Gemini; every other name goes to the second provider. One key serves all of that provider's models.
 * **The cache works the same way** for both. The model name is part of every cache key, so one model's answer is never served for another.
-* **Embeddings and the intent classifier stay on Gemini**, so `GEMINI_API_KEY` is still required.
+* **Embeddings stay on Gemini**, so `GEMINI_API_KEY` is still required.
+* **The intent classifier can move to this provider:** set `CLASSIFIER_MODEL` to one of its models, e.g. `CLASSIFIER_MODEL=Mistral Small 3.2 24B Instruct 2506`. That takes it off the Gemini quota entirely. A small model that answers without "thinking" first suits it best: on 15 sample questions, Mistral Small 3.2 24B chose the right category for all 15, in a median of 0.4 s.
 * **The model list** is at `GET /v1/models` (the same shape as OpenAI's), and fills the playground's Model dropdown: the Gemini models plus the chat models the second provider reports. Any other name can still be requested; in the playground choose "Other".
 * **Cost figures need prices.** A model without a price still works and still counts tokens saved, but it has no cost in Langfuse and its hits are listed under `savings.unpriced_models` instead of being priced. Give it one in `.env`, in USD per million tokens:
 

@@ -26,7 +26,7 @@ from semcache.providers.openai_compatible import (
     DEFAULT_BASE_URL,
     OpenAICompatibleProvider,
 )
-from semcache.providers.router import RoutingProvider
+from semcache.providers.router import RoutingProvider, is_google_model
 from semcache.providers.traced import TracedProvider
 
 logger = logging.getLogger(__name__)
@@ -159,8 +159,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # when tracing is on)
     _provider = GeminiProvider(api_key=settings.gemini_api_key)
     # Optional second provider: with its key set, every model that isn't
-    # Gemini's is answered by it (see providers/router.py). Embeddings and
-    # the intent classifier stay on Gemini either way.
+    # Gemini's is answered by it (see providers/router.py). Embeddings stay
+    # on Gemini either way; the intent classifier does unless CLASSIFIER_MODEL
+    # names one of this provider's models.
     openai_compatible: OpenAICompatibleProvider | None = None
     if settings.openai_compatible_api_key:
         listed = settings.openai_compatible_models
@@ -177,12 +178,20 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     if tracing_on:
         _provider = TracedProvider(_provider)
 
-    # 5. Initialize Intent Classifier
+    # 5. Initialize Intent Classifier (on the second provider when
+    # CLASSIFIER_MODEL isn't a Gemini model)
+    if not is_google_model(settings.classifier_model) and openai_compatible is None:
+        logger.warning(
+            "CLASSIFIER_MODEL=%r isn't a Gemini model, but OPENAI_COMPATIBLE_API_KEY "
+            "is not set: every classification will fall back to the default policy.",
+            settings.classifier_model,
+        )
     _classifier = IntentClassifier(
         api_key=settings.gemini_api_key,
         model=settings.classifier_model,
         timeout_seconds=settings.classifier_timeout_seconds,
         default_policy=default_policy,
+        other_provider=openai_compatible,
     )
 
     # 6. Start background task for Prometheus gauges

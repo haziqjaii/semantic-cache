@@ -52,6 +52,8 @@ class Settings(BaseSettings):
     default_ttl_seconds: int = 86400  # 24 hours
 
     # ── Classifier ─────────────────────────────────────────
+    # A Gemini/Gemma model, or one of the second provider's models (then
+    # asked through it, off the Gemini quota).
     classifier_model: str = "gemini-3.5-flash-lite"
     # The user never waits for the classifier (it finishes after the
     # response), so this can be generous enough for slower models.
@@ -70,8 +72,9 @@ class Settings(BaseSettings):
     # Any service with an OpenAI-style chat completions API: OpenAI itself,
     # or a host serving open models (Mistral, Qwen, gpt-oss, ...) behind one
     # address and one key. With the key set, requests for a model that isn't
-    # Gemini's go there; Gemini models, embeddings and the intent classifier
-    # still use GEMINI_API_KEY.
+    # Gemini's go there; Gemini models and embeddings still use GEMINI_API_KEY,
+    # and so does the intent classifier unless CLASSIFIER_MODEL is one of
+    # this provider's models.
     openai_compatible_api_key: str | None = None
     # The API's address up to the version, e.g. https://host.example/v1
     # ("/chat/completions" is added to it). OpenAI's own if unset.

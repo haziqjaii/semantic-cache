@@ -342,6 +342,109 @@ class TestGemmaClassifier:
         assert config.system_instruction
         assert result.intent == "factual"
 
+
+def _provider_reply(text: str, tokens: int = 150):
+    """An OpenAI-compatible provider's ChatCompletionResponse carrying `text`."""
+    from semcache.schemas import (
+        ChatCompletionChoice,
+        ChatCompletionChoiceMessage,
+        ChatCompletionResponse,
+        UsageInfo,
+    )
+
+    return ChatCompletionResponse(
+        id="chatcmpl-test",
+        created=0,
+        model="mistral-small",
+        choices=[ChatCompletionChoice(message=ChatCompletionChoiceMessage(content=text))],
+        usage=UsageInfo(prompt_tokens=tokens - 3, completion_tokens=3, total_tokens=tokens),
+    )
+
+
+class TestOtherProviderClassifier:
+    @pytest.mark.asyncio
+    async def test_non_gemini_model_is_asked_through_the_other_provider(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from semcache.cache.classifier import _CLASSIFIER_SYSTEM_PROMPT
+
+        provider = MagicMock()
+        provider.generate = AsyncMock(return_value=_provider_reply("TIME_SENSITIVE"))
+        classifier = IntentClassifier(
+            api_key="fake-key", model="Mistral Small 3.2 24B Instruct 2506", other_provider=provider
+        )
+        gemini = AsyncMock()
+        classifier._client.aio.models.generate_content = gemini
+
+        result = await classifier.classify("What's the weather today?")
+
+        request = provider.generate.await_args.args[0]
+        assert request.model == "Mistral Small 3.2 24B Instruct 2506"
+        assert [(m.role, m.content) for m in request.messages] == [
+            ("system", _CLASSIFIER_SYSTEM_PROMPT),
+            ("user", "What's the weather today?"),
+        ]
+        assert request.temperature == 0.0
+        gemini.assert_not_awaited()
+        assert result.policy == TASK_POLICIES["time_sensitive"]
+        assert (result.intent, result.tokens, result.is_fallback) == ("time_sensitive", 150, False)
+
+    @pytest.mark.asyncio
+    async def test_gemini_model_stays_on_gemini_with_a_provider_set(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        provider = MagicMock()
+        provider.generate = AsyncMock()
+        classifier = IntentClassifier(api_key="fake-key", model="gemini-3.1-flash-lite", other_provider=provider)
+        classifier._client.aio.models.generate_content = AsyncMock(
+            return_value=_fake_response('{"category": "factual"}')
+        )
+
+        result = await classifier.classify("What is Python?")
+
+        provider.generate.assert_not_awaited()
+        assert result.intent == "factual"
+
+    @pytest.mark.asyncio
+    async def test_without_the_provider_it_falls_back(self):
+        classifier = IntentClassifier(api_key="fake-key", model="Mistral Small 3.2 24B Instruct 2506")
+
+        result = await classifier.classify_safe("What is Python?")
+
+        assert result.is_fallback is True
+        assert result.policy == DEFAULT_POLICY
+
+    @pytest.mark.asyncio
+    async def test_unreadable_reply_is_a_fallback(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        provider = MagicMock()
+        provider.generate = AsyncMock(return_value=_provider_reply("It could be factual or how_to."))
+        classifier = IntentClassifier(api_key="fake-key", model="qwen-qwen3-8-27b", other_provider=provider)
+
+        result = await classifier.classify_safe("What is Python?")
+
+        assert result.is_fallback is True
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_from_the_provider_is_retried(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from semcache.providers.openai_compatible import ProviderHTTPError
+
+        provider = MagicMock()
+        provider.generate = AsyncMock(
+            side_effect=[ProviderHTTPError(429, "slow down"), _provider_reply("FACTUAL")]
+        )
+        classifier = IntentClassifier(
+            api_key="fake-key", model="qwen-qwen3-8-27b", other_provider=provider, retry_delays=(0, 0, 0)
+        )
+
+        result = await classifier.classify_safe("What is Python?")
+
+        assert provider.generate.await_count == 2
+        assert (result.intent, result.is_fallback) == ("factual", False)
+
     @pytest.mark.asyncio
     async def test_unreadable_reply_is_a_fallback_not_a_guess(self):
         from unittest.mock import AsyncMock
