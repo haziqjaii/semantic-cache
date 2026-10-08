@@ -30,6 +30,13 @@ GEMMA MODELS (e.g. CLASSIFIER_MODEL=gemma-4-26b-a4b-it):
     Gemma the instructions go inside the message and the plain-text reply
     ("FACTUAL") is read by _parse_category.
 
+OTHER PROVIDERS (e.g. CLASSIFIER_MODEL=Mistral Small 3.2 24B Instruct 2506):
+    A model that isn't Gemini's or Gemma's is asked through the second,
+    OpenAI-compatible provider (OPENAI_COMPATIBLE_API_KEY), which takes
+    the Gemini quota off the classifier entirely. The instructions go as a
+    system message and the plain-text reply is read by _parse_category.
+    Its 429 and 5xx errors are retried just like Google's.
+
 FAILURE HANDLING:
     The classifier MUST NEVER break the user-facing response. If it
     times out, hits a rate limit, or returns garbage, we fall back to
@@ -55,6 +62,9 @@ from google import genai
 from google.genai import types
 
 from semcache.cache.policy import DEFAULT_POLICY, TASK_POLICIES, CachePolicy
+from semcache.providers.base import LLMProvider
+from semcache.providers.router import is_google_model
+from semcache.schemas import ChatCompletionRequest, ChatMessage
 
 logger = logging.getLogger(__name__)
 
@@ -138,8 +148,9 @@ RETRY_DELAYS_SECONDS = (1.0, 2.0, 4.0)
 
 
 def _is_brief_error(exc: Exception) -> bool:
-    """A Google error worth retrying: rate-limited (429) or a server-side failure (5xx)."""
-    code = getattr(exc, "code", None)  # google.genai.errors.APIError carries the HTTP status
+    """An error worth retrying: rate-limited (429) or a server-side failure (5xx)."""
+    # google.genai.errors.APIError and ProviderHTTPError both carry the HTTP status
+    code = getattr(exc, "code", None)
     return isinstance(code, int) and (code == 429 or code >= 500)
 
 
@@ -158,8 +169,14 @@ class IntentClassifier:
     Classifies prompts into intent categories using an LLM.
 
     Gemini models use structured outputs (response_schema) to guarantee
-    exactly one valid category. Gemma models don't support that, so their
-    plain-text reply is parsed instead (see the module docstring).
+    exactly one valid category. Gemma models and the second provider's
+    models don't support that, so their plain-text reply is parsed instead
+    (see the module docstring).
+
+    Args:
+        other_provider: The OpenAI-compatible provider, which answers for
+            any model that isn't Gemini's. Without it, such a model fails
+            every call (and so falls back to the default policy).
     """
 
     def __init__(
@@ -169,8 +186,10 @@ class IntentClassifier:
         timeout_seconds: float = 5.0,
         default_policy: CachePolicy | None = None,
         retry_delays: tuple[float, ...] = RETRY_DELAYS_SECONDS,
+        other_provider: LLMProvider | None = None,
     ) -> None:
         self._client = genai.Client(api_key=api_key)
+        self._other_provider = other_provider
         self._model = model
         self._timeout = timeout_seconds
         self._retry_delays = retry_delays
@@ -188,8 +207,8 @@ class IntentClassifier:
         """
         Classify a prompt and return the corresponding CachePolicy.
 
-        Calls gemini-3.5-flash-lite with structured output to get
-        a category, then maps it to a predefined CachePolicy.
+        Asks the classifier model for a category, then maps it to a
+        predefined CachePolicy.
 
         Args:
             prompt: The user's message text.
@@ -198,9 +217,34 @@ class IntentClassifier:
             A ClassifierResult containing the policy and tokens used.
 
         Raises:
-            Any exception from the Gemini SDK, asyncio timeout, etc.
-            Callers should use classify_safe() instead.
+            Any exception from the Gemini SDK or the other provider,
+            asyncio timeout, etc. Callers should use classify_safe() instead.
         """
+        if is_google_model(self._model):
+            reply, tokens = await self._ask_google(prompt)
+        else:
+            reply, tokens = await self._ask_other_provider(prompt)
+
+        category_str = _parse_category(reply)
+        if category_str is None:
+            # Counted as a fallback by classify_safe, rather than guessing a category.
+            raise ValueError(f"Classifier reply names no single category: {reply!r}")
+
+        # Map to our predefined policies.
+        policy = TASK_POLICIES[category_str]
+
+        logger.info("Classified prompt as '%s' → TTL=%ds, threshold=%.2f (tokens: %d)",
+                     category_str, policy.ttl_seconds, policy.similarity_threshold, tokens)
+
+        return ClassifierResult(
+            policy=policy,
+            tokens=tokens,
+            is_fallback=False,
+            intent=category_str,
+        )
+
+    async def _ask_google(self, prompt: str) -> tuple[str, int]:
+        """The reply of a Gemini or Gemma model, and the tokens it used."""
         if _is_gemma(self._model):
             # Gemma takes no system instruction, JSON mode or temperature:
             # the instructions travel in the message itself.
@@ -223,24 +267,27 @@ class IntentClassifier:
 
         # Extract tokens used (safely handling None)
         tokens = (response.usage_metadata.total_token_count or 0) if response.usage_metadata else 0
+        return response.text or "", tokens
 
-        category_str = _parse_category(response.text or "")
-        if category_str is None:
-            # Counted as a fallback by classify_safe, rather than guessing a category.
-            raise ValueError(f"Classifier reply names no single category: {response.text!r}")
-
-        # Map to our predefined policies.
-        policy = TASK_POLICIES[category_str]
-
-        logger.info("Classified prompt as '%s' → TTL=%ds, threshold=%.2f (tokens: %d)",
-                     category_str, policy.ttl_seconds, policy.similarity_threshold, tokens)
-
-        return ClassifierResult(
-            policy=policy,
-            tokens=tokens,
-            is_fallback=False,
-            intent=category_str,
+    async def _ask_other_provider(self, prompt: str) -> tuple[str, int]:
+        """The reply of a model on the OpenAI-compatible provider, and the tokens it used."""
+        if self._other_provider is None:
+            raise RuntimeError(
+                f"CLASSIFIER_MODEL={self._model!r} isn't a Gemini model, and no "
+                "OPENAI_COMPATIBLE_API_KEY is set to reach the provider that serves it."
+            )
+        request = ChatCompletionRequest(
+            model=self._model,
+            messages=[
+                ChatMessage(role="system", content=_CLASSIFIER_SYSTEM_PROMPT),
+                ChatMessage(role="user", content=prompt),
+            ],
+            temperature=0.0,  # Deterministic — we want consistent classification
+            max_tokens=20,  # one category name; stops a chatty model early
         )
+        response = await asyncio.wait_for(self._other_provider.generate(request), timeout=self._timeout)
+        tokens = response.usage.total_tokens if response.usage else 0
+        return response.choices[0].message.content, tokens
 
     async def classify_safe(self, prompt: str) -> ClassifierResult:
         """
